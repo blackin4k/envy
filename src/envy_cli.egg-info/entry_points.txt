@@ -1,0 +1,2 @@
+[console_scripts]
+envy = envy.cli:main

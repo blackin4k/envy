@@ -1,0 +1,9 @@
+pyproject.toml
+src/envy/__init__.py
+src/envy/cli.py
+src/envy/resolver.py
+src/envy_cli.egg-info/PKG-INFO
+src/envy_cli.egg-info/SOURCES.txt
+src/envy_cli.egg-info/dependency_links.txt
+src/envy_cli.egg-info/entry_points.txt
+src/envy_cli.egg-info/top_level.txt
