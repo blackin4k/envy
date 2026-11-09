@@ -1,6 +1,0 @@
-Metadata-Version: 2.4
-Name: envy-cli
-Version: 0.1.0
-Summary: Automatic Python virtual environment switching
-License: MIT
-Requires-Python: >=3.11

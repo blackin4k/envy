@@ -1,17 +1,50 @@
-# Virtual environments
-.venv/
-venv/
-env/
 
 # Python cache
 __pycache__/
 *.py[cod]
+*$py.class
 
-# Build artifacts
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Python packaging
 *.egg-info/
 build/
 dist/
+.eggs/
+wheels/
 
-# Editors
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type checking and linting
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# IDEs and editors
 .vscode/
 .idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak

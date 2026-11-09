@@ -1,0 +1,15 @@
+# Set default line-ending handling
+* text=auto
+
+# Python and configs
+*.py text eol=lf
+*.toml text eol=lf
+*.md text
+
+# Shell scripts (must always use LF for POSIX/WSL compatibility)
+*.sh text eol=lf
+*.bash text eol=lf
+
+# PowerShell scripts
+*.ps1 text eol=crlf
+
