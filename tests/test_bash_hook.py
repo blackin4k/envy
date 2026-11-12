@@ -643,6 +643,392 @@ echo "ALL_BASH_DIAGNOSTIC_VISIBILITY_TESTS_PASSED"
         self.assertEqual(res.returncode, 0, f"Failed: {res.stderr.decode('utf-8')}\nstdout: {res.stdout.decode('utf-8')}")
         self.assertIn("ALL_BASH_DIAGNOSTIC_VISIBILITY_TESTS_PASSED", res.stdout.decode("utf-8"))
 
+    @unittest.skipUnless(is_wsl_available(), "WSL Bash is required for this test")
+    def test_wsl_bash_lifecycle_reliability(self):
+        """Verify activation failure recovery, rollback, environment deletion while active, and PATH stability in Bash."""
+        wsl = shutil.which("wsl.exe") or shutil.which("wsl") or "bash"
+        repo_wsl_path = "/mnt/c/Users/fasiu/envy"
+
+        script = """
+set -e
+TEST_DIR=$(mktemp -d /tmp/envy_bash_lifecycle_XXXXXX)
+trap 'rm -rf "$TEST_DIR"' EXIT
+
+PROJ_A="$TEST_DIR/projA"
+PROJ_B="$TEST_DIR/projB"
+BROKEN_PROJ="$TEST_DIR/broken_proj"
+NO_VENV="$TEST_DIR/no_venv"
+
+mkdir -p "$PROJ_A/.venv/bin" "$PROJ_B/.venv/bin" "$BROKEN_PROJ/.venv/bin" "$NO_VENV"
+
+create_valid_activate() {
+    local venv_dir="$1"
+    local bin_dir="$venv_dir/bin"
+    cat << 'EOF' > "$bin_dir/activate"
+deactivate () {
+    if [ -n "${_OLD_VIRTUAL_PATH:-}" ] ; then
+        PATH="${_OLD_VIRTUAL_PATH}"
+        export PATH
+        unset _OLD_VIRTUAL_PATH
+    fi
+    unset VIRTUAL_ENV
+    unset VIRTUAL_ENV_PROMPT
+    if [ ! "${1-}" = "nondestructive" ] ; then
+        unset -f deactivate
+    fi
+}
+deactivate nondestructive
+VIRTUAL_ENV="__VENV_DIR__"
+export VIRTUAL_ENV
+_OLD_VIRTUAL_PATH="$PATH"
+PATH="__BIN_DIR__:$PATH"
+export PATH
+EOF
+    sed -i "s|__VENV_DIR__|$venv_dir|g" "$bin_dir/activate"
+    sed -i "s|__BIN_DIR__|$bin_dir|g" "$bin_dir/activate"
+    ln -sf /usr/bin/python3 "$bin_dir/python"
+}
+
+create_failing_activate() {
+    local venv_dir="$1"
+    local bin_dir="$venv_dir/bin"
+    cat << 'EOF' > "$bin_dir/activate"
+VIRTUAL_ENV="__VENV_DIR__"
+export VIRTUAL_ENV
+_OLD_VIRTUAL_PATH="$PATH"
+PATH="__BIN_DIR__:$PATH"
+export PATH
+return 1 # simulated activation script crash halfway through
+EOF
+    sed -i "s|__VENV_DIR__|$venv_dir|g" "$bin_dir/activate"
+    sed -i "s|__BIN_DIR__|$bin_dir|g" "$bin_dir/activate"
+    ln -sf /usr/bin/python3 "$bin_dir/python"
+}
+
+create_valid_activate "$PROJ_A/.venv"
+create_valid_activate "$PROJ_B/.venv"
+create_failing_activate "$BROKEN_PROJ/.venv"
+
+cat << 'EOF' > "$TEST_DIR/envy_shim"
+#!/bin/bash
+exec /usr/bin/python3 -m envy.cli "$@"
+EOF
+chmod +x "$TEST_DIR/envy_shim"
+
+export PYTHONPATH="__REPO_PATH__/src"
+export ENVY_BIN="$TEST_DIR/envy_shim"
+
+HOOK_CODE=$(/usr/bin/python3 -m envy.cli init bash)
+eval "$HOOK_CODE"
+
+OUT_FILE="$TEST_DIR/stdout.txt"
+ERR_FILE="$TEST_DIR/stderr.txt"
+
+ORIG_PATH="$PATH"
+cd "$NO_VENV"
+__envy_hook >/dev/null
+
+# --- 1. Activation failure recovery & rollback ---
+cd "$BROKEN_PROJ"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+err=$(cat "$ERR_FILE")
+
+if [[ "$out" == *"envy: venv loaded"* ]]; then
+    echo "Should NOT report 'envy: venv loaded' when activation failed, got: $out" >&2
+    exit 1
+fi
+if [[ "$err" != *"envy: failed to activate environment at"* ]]; then
+    echo "Expected failure diagnostic on stderr, got: '$err'" >&2
+    exit 1
+fi
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    echo "VIRTUAL_ENV was not rolled back after activation failure: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+if [[ -n "$ENVY_MANAGED_VENV" ]]; then
+    echo "ENVY_MANAGED_VENV was set after activation failure: $ENVY_MANAGED_VENV" >&2
+    exit 1
+fi
+if [[ "$PATH" != "$ORIG_PATH" ]]; then
+    echo "PATH was not rolled back to original after activation failure!" >&2
+    exit 1
+fi
+if type -t deactivate >/dev/null 2>&1; then
+    echo "deactivate function was left behind after activation failure" >&2
+    exit 1
+fi
+
+# Repeated prompt in broken_proj -> no repeated diagnostic or crash
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out_repeat=$(cat "$OUT_FILE")
+err_repeat=$(cat "$ERR_FILE")
+if [[ -n "$out_repeat" || -n "$err_repeat" ]]; then
+    echo "Expected quiet repeat prompt in broken project, got out='$out_repeat', err='$err_repeat'" >&2
+    exit 1
+fi
+
+# --- 2. Repair broken_proj and re-enter -> succeeds ---
+create_valid_activate "$BROKEN_PROJ/.venv"
+
+cd "$NO_VENV"
+__envy_hook >/dev/null
+
+cd "$BROKEN_PROJ"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+if [[ "$out" != *"envy: venv loaded"* ]]; then
+    echo "Repaired environment was not loaded on re-entry, got: $out" >&2
+    exit 1
+fi
+if [[ "$VIRTUAL_ENV" != "$BROKEN_PROJ/.venv" ]]; then
+    echo "Repaired environment VIRTUAL_ENV not set, got: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+
+# --- 3. Switch from valid environment to a broken environment ---
+cd "$PROJ_A"
+__envy_hook >/dev/null
+if [[ "$VIRTUAL_ENV" != "$PROJ_A/.venv" ]]; then
+    echo "projA not loaded, got: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+
+# Break broken_proj again
+create_failing_activate "$BROKEN_PROJ/.venv"
+
+cd "$BROKEN_PROJ"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+err=$(cat "$ERR_FILE")
+
+if [[ "$out" != *"envy: venv unloaded"* ]]; then
+    echo "projA was not unloaded when switching to broken project, got: $out" >&2
+    exit 1
+fi
+if [[ "$out" == *"envy: venv loaded"* ]]; then
+    echo "broken project reported as loaded, got: $out" >&2
+    exit 1
+fi
+if [[ "$err" != *"envy: failed to activate environment at"* ]]; then
+    echo "Expected failure diagnostic on stderr for broken project, got: '$err'" >&2
+    exit 1
+fi
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    echo "VIRTUAL_ENV not empty after switching to broken project: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+if [[ -n "$ENVY_MANAGED_VENV" ]]; then
+    echo "ENVY_MANAGED_VENV not empty after switching to broken project: $ENVY_MANAGED_VENV" >&2
+    exit 1
+fi
+if [[ "$PATH" != "$ORIG_PATH" ]]; then
+    echo "PATH not restored after switching to broken project!" >&2
+    exit 1
+fi
+
+# --- 4. Active .venv directory deleted while inside project ---
+cd "$PROJ_A"
+__envy_hook >/dev/null
+if [[ "$VIRTUAL_ENV" != "$PROJ_A/.venv" ]]; then
+    echo "projA failed to activate" >&2
+    exit 1
+fi
+
+rm -rf "$PROJ_A/.venv"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+if [[ "$out" != *"envy: venv unloaded"* ]]; then
+    echo "Expected 'envy: venv unloaded' after deleting .venv, got: $out" >&2
+    exit 1
+fi
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    echo "VIRTUAL_ENV was not cleared after .venv was deleted, got: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+if [[ -n "$ENVY_MANAGED_VENV" ]]; then
+    echo "ENVY_MANAGED_VENV was not cleared after .venv was deleted, got: $ENVY_MANAGED_VENV" >&2
+    exit 1
+fi
+if [[ "$PATH" != "$ORIG_PATH" ]]; then
+    echo "PATH was not restored to original after deleting active .venv" >&2
+    exit 1
+fi
+
+# --- 5. Active interpreter deleted while inside project ---
+cd "$PROJ_B"
+__envy_hook >/dev/null
+if [[ "$VIRTUAL_ENV" != "$PROJ_B/.venv" ]]; then
+    echo "projB failed to activate" >&2
+    exit 1
+fi
+
+rm -f "$PROJ_B/.venv/bin/python"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+err=$(cat "$ERR_FILE")
+
+if [[ "$out" != *"envy: venv unloaded"* ]]; then
+    echo "Expected 'envy: venv unloaded' after deleting interpreter, got: $out" >&2
+    exit 1
+fi
+if [[ "$err" != *"envy: error:"* ]]; then
+    echo "Expected resolver error diagnostic on stderr after deleting interpreter, got: '$err'" >&2
+    exit 1
+fi
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    echo "VIRTUAL_ENV was not cleared after interpreter was deleted, got: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+if [[ -n "$ENVY_MANAGED_VENV" ]]; then
+    echo "ENVY_MANAGED_VENV was not cleared after interpreter was deleted, got: $ENVY_MANAGED_VENV" >&2
+    exit 1
+fi
+
+# --- 6. Active activation script deleted while inside project ---
+ln -sf /usr/bin/python3 "$PROJ_B/.venv/bin/python"
+cd "$NO_VENV"
+__envy_hook >/dev/null
+cd "$PROJ_B"
+__envy_hook >/dev/null
+if [[ "$VIRTUAL_ENV" != "$PROJ_B/.venv" ]]; then
+    echo "projB failed to activate before deleting activate script" >&2
+    exit 1
+fi
+
+rm -f "$PROJ_B/.venv/bin/activate"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+err=$(cat "$ERR_FILE")
+
+if [[ "$out" != *"envy: venv unloaded"* ]]; then
+    echo "Expected 'envy: venv unloaded' after deleting activate script, got: $out" >&2
+    exit 1
+fi
+if [[ "$err" != *"envy: error:"* ]]; then
+    echo "Expected resolver error diagnostic on stderr after deleting activate script, got: '$err'" >&2
+    exit 1
+fi
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    echo "VIRTUAL_ENV was not cleared after activate script was deleted, got: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+if [[ -n "$ENVY_MANAGED_VENV" ]]; then
+    echo "ENVY_MANAGED_VENV was not cleared after activate script was deleted, got: $ENVY_MANAGED_VENV" >&2
+    exit 1
+fi
+
+# --- 7. Function preservation: pre-existing deactivate function exact restoration ---
+deactivate() { echo "CUSTOM_DEACTIVATE_ACTIVE"; }
+
+# Case A: Failing activation preserves pre-existing deactivate function
+cd "$NO_VENV"
+__envy_hook >/dev/null
+cd "$BROKEN_PROJ"
+__envy_hook >/dev/null 2>&1
+post_fail_deact=$(deactivate)
+if [[ "$post_fail_deact" != "CUSTOM_DEACTIVATE_ACTIVE" ]]; then
+    echo "Pre-existing deactivate function was lost after activation failure! Got: $post_fail_deact" >&2
+    exit 1
+fi
+
+# Re-create valid activate script for projB
+create_valid_activate "$PROJ_B/.venv"
+
+# Case B: Successful activation and subsequent deactivation restores original deactivate function
+cd "$NO_VENV"
+__envy_hook >/dev/null
+cd "$PROJ_B"
+__envy_hook >/dev/null
+if [[ "$VIRTUAL_ENV" != "$PROJ_B/.venv" ]]; then
+    echo "projB failed to activate in function preservation test" >&2
+    exit 1
+fi
+cd "$NO_VENV"
+__envy_hook >/dev/null
+post_unload_deact=$(deactivate)
+if [[ "$post_unload_deact" != "CUSTOM_DEACTIVATE_ACTIVE" ]]; then
+    echo "Pre-existing deactivate function was lost after managed venv unloaded! Got: $post_unload_deact" >&2
+    exit 1
+fi
+
+# Case C: Explicit manual deactivation restores original deactivate function
+cd "$PROJ_B"
+__envy_hook >/dev/null
+if [[ "$VIRTUAL_ENV" != "$PROJ_B/.venv" ]]; then
+    echo "projB failed to activate for manual deactivation test" >&2
+    exit 1
+fi
+deactivate
+__envy_hook >/dev/null
+post_manual_deact=$(deactivate)
+if [[ "$post_manual_deact" != "CUSTOM_DEACTIVATE_ACTIVE" ]]; then
+    echo "Pre-existing deactivate function was lost after manual deactivation! Got: $post_manual_deact" >&2
+    exit 1
+fi
+# Sticky deactivation: should NOT reactivate on repeat in same directory
+__envy_hook >/dev/null
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    echo "Envy reactivated immediately after manual deactivation in same dir!" >&2
+    exit 1
+fi
+
+# Case D: Re-entering project after manual deactivation re-activates, and subsequent unload preserves original function
+cd "$NO_VENV"
+__envy_hook >/dev/null
+cd "$PROJ_B"
+__envy_hook >/dev/null
+if [[ "$VIRTUAL_ENV" != "$PROJ_B/.venv" ]]; then
+    echo "projB failed to re-activate after re-entry!" >&2
+    exit 1
+fi
+cd "$NO_VENV"
+__envy_hook >/dev/null
+post_reenter_deact=$(deactivate)
+if [[ "$post_reenter_deact" != "CUSTOM_DEACTIVATE_ACTIVE" ]]; then
+    echo "Pre-existing deactivate function was lost after re-entry activation/unload! Got: $post_reenter_deact" >&2
+    exit 1
+fi
+unset -f deactivate
+
+# --- 8. Bash rejecting a Windows-only environment health check ---
+WIN_ONLY_DIR="$TEST_DIR/win_only_env"
+mkdir -p "$WIN_ONLY_DIR/.venv/Scripts"
+touch "$WIN_ONLY_DIR/.venv/Scripts/python.exe"
+touch "$WIN_ONLY_DIR/.venv/Scripts/Activate.ps1"
+cd "$WIN_ONLY_DIR"
+__envy_hook >/dev/null 2>&1 || true
+if [[ -n "$VIRTUAL_ENV" || -n "$ENVY_MANAGED_VENV" ]]; then
+    echo "Bash hook accepted a Windows-only environment!" >&2
+    exit 1
+fi
+
+# --- 8. Repeated activation/deactivation cycles: PATH stability ---
+cd "$NO_VENV"
+__envy_hook >/dev/null
+PRE_LOOP_PATH="$PATH"
+
+for i in {1..10}; do
+    cd "$PROJ_B"
+    __envy_hook >/dev/null
+    cd "$NO_VENV"
+    __envy_hook >/dev/null
+done
+
+if [[ "$PATH" != "$PRE_LOOP_PATH" ]]; then
+    echo "PATH accumulated duplicate entries during 10 activation/deactivation cycles!" >&2
+    echo "Initial: $PRE_LOOP_PATH" >&2
+    echo "Final:   $PATH" >&2
+    exit 1
+fi
+
+echo "ALL_BASH_LIFECYCLE_RELIABILITY_TESTS_PASSED"
+""".replace("__REPO_PATH__", repo_wsl_path).replace("\r\n", "\n")
+
+        res = subprocess.run([wsl, "bash"], input=script.encode("utf-8"), capture_output=True)
+        self.assertEqual(res.returncode, 0, f"Failed: {res.stderr.decode('utf-8')}\nstdout: {res.stdout.decode('utf-8')}")
+        self.assertIn("ALL_BASH_LIFECYCLE_RELIABILITY_TESTS_PASSED", res.stdout.decode("utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

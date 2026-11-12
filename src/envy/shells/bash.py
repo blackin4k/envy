@@ -12,6 +12,8 @@ if [[ -z "${__ENVY_HOOKED:-}" ]]; then
     export ENVY_MANAGED_VENV=""
     export ENVY_DEACTIVATED_DIR=""
     export ENVY_FAILED_DIR=""
+    export __ENVY_PREV_PATH=""
+    export __ENVY_SAVED_DEACTIVATE_DEF=""
     __envy_oldpwd=""
 
     __envy_bin() {
@@ -24,6 +26,45 @@ if [[ -z "${__ENVY_HOOKED:-}" ]]; then
         else
             \builtin echo "envy binary not found in PATH or at __ENVY_BIN_PATH__" >&2
             return 1
+        fi
+    }
+
+    __envy_deactivate() {
+        if [[ -n "${ENVY_MANAGED_VENV:-}" ]]; then
+            \builtin local deactivated=0
+            if \builtin type -t deactivate >/dev/null 2>&1; then
+                deactivate 2>/dev/null && deactivated=1 || deactivated=0
+            fi
+
+            # Fallback cleanup in case deactivate was missing or failed to clean up
+            if [[ -n "${_OLD_VIRTUAL_PATH:-}" ]]; then
+                export PATH="${_OLD_VIRTUAL_PATH}"
+                \builtin unset _OLD_VIRTUAL_PATH
+            elif [[ -n "${__ENVY_PREV_PATH:-}" ]]; then
+                export PATH="${__ENVY_PREV_PATH}"
+            fi
+
+            if [[ -n "${_OLD_VIRTUAL_PYTHONHOME:-}" ]]; then
+                export PYTHONHOME="${_OLD_VIRTUAL_PYTHONHOME}"
+                \builtin unset _OLD_VIRTUAL_PYTHONHOME
+            fi
+
+            \builtin unset VIRTUAL_ENV
+            \builtin unset VIRTUAL_ENV_PROMPT
+            \builtin unset _OLD_VIRTUAL_PS1
+            \builtin unset __ENVY_PREV_PATH
+
+            # Restore pre-existing deactivate function if there was one; otherwise ensure cleanup
+            if [[ -n "${__ENVY_SAVED_DEACTIVATE_DEF:-}" ]]; then
+                \builtin eval "${__ENVY_SAVED_DEACTIVATE_DEF}" 2>/dev/null || true
+                export __ENVY_SAVED_DEACTIVATE_DEF=""
+            else
+                \builtin unset -f deactivate 2>/dev/null || true
+            fi
+            \builtin hash -r 2>/dev/null || true
+
+            export ENVY_MANAGED_VENV=""
+            \builtin echo "envy: venv unloaded"
         fi
     }
 
@@ -43,10 +84,24 @@ if [[ -z "${__ENVY_HOOKED:-}" ]]; then
         if [[ -n "${ENVY_MANAGED_VENV:-}" && -z "${VIRTUAL_ENV:-}" ]]; then
             export ENVY_DEACTIVATED_DIR="${dir}"
             export ENVY_MANAGED_VENV=""
+            if [[ -n "${__ENVY_SAVED_DEACTIVATE_DEF:-}" ]]; then
+                \builtin eval "${__ENVY_SAVED_DEACTIVATE_DEF}" 2>/dev/null || true
+                export __ENVY_SAVED_DEACTIVATE_DEF=""
+            fi
         fi
 
         # If directory has not changed and managed state matches environment, nothing to do
-        if [[ "${dir}" == "${__envy_oldpwd}" && "${ENVY_MANAGED_VENV%/}" == "${VIRTUAL_ENV%/}" ]]; then
+        # BUT if managed venv, its Linux interpreter, or its Linux activation script was deleted on disk, do not return early
+        \builtin local venv_valid=1
+        if [[ -n "${ENVY_MANAGED_VENV:-}" ]]; then
+            if [[ ! -d "${ENVY_MANAGED_VENV}" || \
+                  ! -e "${ENVY_MANAGED_VENV}/bin/python" || \
+                  ! -f "${ENVY_MANAGED_VENV}/bin/activate" ]]; then
+                venv_valid=0
+            fi
+        fi
+
+        if [[ "${dir}" == "${__envy_oldpwd}" && "${ENVY_MANAGED_VENV%/}" == "${VIRTUAL_ENV%/}" && ${venv_valid} -eq 1 ]]; then
             return "${retval}"
         fi
 
@@ -79,25 +134,29 @@ if [[ -z "${__ENVY_HOOKED:-}" ]]; then
             \builtin local norm_resolved="${resolved%/}"
             if [[ "${ENVY_MANAGED_VENV%/}" != "${norm_resolved}" ]]; then
                 # Deactivate previously managed venv if one was active
-                if [[ -n "${ENVY_MANAGED_VENV:-}" ]] && \builtin type -t deactivate >/dev/null 2>&1; then
-                    deactivate
-                    export ENVY_MANAGED_VENV=""
-                    \builtin echo "envy: venv unloaded"
-                fi
+                __envy_deactivate
 
                 \builtin local activate_script="${resolved}/bin/activate"
+
                 if [[ -f "${activate_script}" ]]; then
+                    # Snapshot pre-activation shell state for rollback on failure
+                    \builtin local _pre_path="${PATH}"
+                    \builtin local _pre_venv="${VIRTUAL_ENV:-}"
+                    \builtin local _pre_prompt="${VIRTUAL_ENV_PROMPT:-}"
+                    \builtin local _pre_pyhome="${PYTHONHOME:-}"
+                    \builtin local _pre_deactivate_def=""
+                    if \builtin type -t deactivate >/dev/null 2>&1; then
+                        _pre_deactivate_def="$(\builtin declare -f deactivate 2>/dev/null)"
+                    fi
+
                     \builtin local prev_disable_prompt="${VIRTUAL_ENV_DISABLE_PROMPT:-}"
                     export VIRTUAL_ENV_DISABLE_PROMPT=1
 
+                    \builtin local act_ok=0
                     if . "${activate_script}"; then
-                        export ENVY_MANAGED_VENV="${VIRTUAL_ENV:-${resolved}}"
-                        export ENVY_FAILED_DIR=""
-                        \builtin echo "envy: venv loaded"
-                    else
-                        \builtin echo "envy: failed to activate environment at '${resolved}'" >&2
-                        export ENVY_FAILED_DIR="${dir}"
-                        export ENVY_MANAGED_VENV=""
+                        if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+                            act_ok=1
+                        fi
                     fi
 
                     if [[ -z "${prev_disable_prompt}" ]]; then
@@ -105,17 +164,57 @@ if [[ -z "${__ENVY_HOOKED:-}" ]]; then
                     else
                         export VIRTUAL_ENV_DISABLE_PROMPT="${prev_disable_prompt}"
                     fi
+
+                    if [[ ${act_ok} -eq 1 ]]; then
+                        export ENVY_MANAGED_VENV="${VIRTUAL_ENV:-${resolved}}"
+                        export __ENVY_PREV_PATH="${_pre_path}"
+                        export __ENVY_SAVED_DEACTIVATE_DEF="${_pre_deactivate_def}"
+                        export ENVY_FAILED_DIR=""
+                        \builtin echo "envy: venv loaded"
+                    else
+                        # Rollback on activation failure
+                        if \builtin type -t deactivate >/dev/null 2>&1; then
+                            deactivate 2>/dev/null || true
+                        fi
+                        export PATH="${_pre_path}"
+                        if [[ -n "${_pre_venv}" ]]; then
+                            export VIRTUAL_ENV="${_pre_venv}"
+                        else
+                            \builtin unset VIRTUAL_ENV
+                        fi
+                        if [[ -n "${_pre_prompt}" ]]; then
+                            export VIRTUAL_ENV_PROMPT="${_pre_prompt}"
+                        else
+                            \builtin unset VIRTUAL_ENV_PROMPT
+                        fi
+                        if [[ -n "${_pre_pyhome}" ]]; then
+                            export PYTHONHOME="${_pre_pyhome}"
+                        else
+                            \builtin unset PYTHONHOME
+                        fi
+                        \builtin unset _OLD_VIRTUAL_PATH
+                        \builtin unset _OLD_VIRTUAL_PYTHONHOME
+                        \builtin unset _OLD_VIRTUAL_PS1
+                        \builtin unset __ENVY_PREV_PATH
+
+                        # Restore pre-existing deactivate function if there was one; otherwise ensure cleanup
+                        if [[ -n "${_pre_deactivate_def}" ]]; then
+                            \builtin eval "${_pre_deactivate_def}" 2>/dev/null || true
+                        else
+                            \builtin unset -f deactivate 2>/dev/null || true
+                        fi
+                        export __ENVY_SAVED_DEACTIVATE_DEF=""
+                        \builtin hash -r 2>/dev/null || true
+
+                        export ENVY_FAILED_DIR="${dir}"
+                        export ENVY_MANAGED_VENV=""
+                        \builtin echo "envy: failed to activate environment at '${resolved}'" >&2
+                    fi
                 fi
             fi
         else
             # No venv found for this directory; deactivate managed venv if one was active
-            if [[ -n "${ENVY_MANAGED_VENV:-}" ]]; then
-                if \builtin type -t deactivate >/dev/null 2>&1; then
-                    deactivate
-                fi
-                export ENVY_MANAGED_VENV=""
-                \builtin echo "envy: venv unloaded"
-            fi
+            __envy_deactivate
         fi
 
         return "${retval}"

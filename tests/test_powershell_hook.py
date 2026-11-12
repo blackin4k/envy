@@ -696,6 +696,330 @@ Write-Output "ALL_POWERSHELL_DIAGNOSTIC_VISIBILITY_TESTS_PASSED"
             self.assertEqual(res.returncode, 0, f"Diag test failed with stderr: {res.stderr}\nstdout: {res.stdout}")
             self.assertIn("ALL_POWERSHELL_DIAGNOSTIC_VISIBILITY_TESTS_PASSED", res.stdout)
 
+    @unittest.skipUnless(sys.platform == "win32", "PowerShell tests require Windows")
+    def test_powershell_lifecycle_reliability(self):
+        """Verify activation failure recovery, rollback, environment deletion while active, and PATH stability."""
+        pwsh = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not pwsh:
+            self.skipTest("powershell executable not found")
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            proj_a = base / "projA"
+            proj_b = base / "projB"
+            broken_proj = base / "brokenProj"
+            no_venv = base / "no_venv"
+            linux_only_proj = base / "linux_only"
+
+            for d in (proj_a, proj_b, broken_proj, no_venv, linux_only_proj):
+                d.mkdir()
+
+            dummy_pe = make_dummy_pe()
+            for p in (proj_a, proj_b, broken_proj):
+                sdir = p / ".venv" / "Scripts"
+                sdir.mkdir(parents=True)
+                (sdir / "python.exe").write_bytes(dummy_pe)
+
+            linux_bin = linux_only_proj / ".venv" / "bin"
+            linux_bin.mkdir(parents=True)
+            (linux_bin / "python").touch()
+            (linux_bin / "activate").touch()
+
+            valid_activate = """
+function global:deactivate ([switch]$NonDestructive) {
+    if (Test-Path Env:_OLD_VIRTUAL_PATH) {
+        $Env:PATH = $Env:_OLD_VIRTUAL_PATH
+        Remove-Item Env:_OLD_VIRTUAL_PATH
+    }
+    Remove-Item env:VIRTUAL_ENV -ErrorAction SilentlyContinue
+    if (-not $NonDestructive) {
+        Remove-Item -Path function:deactivate
+    }
+}
+deactivate -nondestructive
+$env:VIRTUAL_ENV = "__VENV_DIR__"
+$Env:_OLD_VIRTUAL_PATH = $Env:PATH
+$Env:PATH = "__BIN_DIR__;$Env:PATH"
+"""
+            (proj_a / ".venv" / "Scripts" / "Activate.ps1").write_text(
+                valid_activate.replace("__VENV_DIR__", str(proj_a / ".venv")).replace("__BIN_DIR__", str(proj_a / ".venv" / "Scripts")),
+                encoding="utf-8",
+            )
+            (proj_b / ".venv" / "Scripts" / "Activate.ps1").write_text(
+                valid_activate.replace("__VENV_DIR__", str(proj_b / ".venv")).replace("__BIN_DIR__", str(proj_b / ".venv" / "Scripts")),
+                encoding="utf-8",
+            )
+
+            # Broken Activate.ps1 modifies PATH and sets VIRTUAL_ENV, then throws halfway through
+            failing_activate = """
+$env:VIRTUAL_ENV = "__VENV_DIR__"
+$Env:_OLD_VIRTUAL_PATH = $Env:PATH
+$Env:PATH = "__BIN_DIR__;$Env:PATH"
+throw "Simulated activation script crash halfway through"
+"""
+            (broken_proj / ".venv" / "Scripts" / "Activate.ps1").write_text(
+                failing_activate.replace("__VENV_DIR__", str(broken_proj / ".venv")).replace("__BIN_DIR__", str(broken_proj / ".venv" / "Scripts")),
+                encoding="utf-8",
+            )
+
+            sibling_envy = Path(sys.executable).parent / "envy.exe"
+            envy_bin = str(sibling_envy) if sibling_envy.is_file() else "envy"
+
+            hook_code = get_powershell_hook(envy_bin=envy_bin)
+            hook_file = base / "envy_hook.ps1"
+            hook_file.write_text(hook_code, encoding="utf-8")
+
+            test_script = f"""
+$ErrorActionPreference = 'Stop'
+function global:prompt {{ 'PS> ' }}
+. '{hook_file}'
+
+$origPath = $env:PATH
+Set-Location '{no_venv}'
+$null = prompt
+
+# --- 1. Activation failure recovery & rollback ---
+Set-Location '{broken_proj}'
+$out1 = [string](prompt)
+
+if ($out1.Contains("envy: venv loaded")) {{
+    throw "Should NOT report 'envy: venv loaded' when activation failed, got: $out1"
+}}
+if ($env:VIRTUAL_ENV) {{
+    throw "VIRTUAL_ENV was not rolled back after activation failure, got: $env:VIRTUAL_ENV"
+}}
+if ($global:ENVY_MANAGED_VENV) {{
+    throw "ENVY_MANAGED_VENV was set after activation failure: $global:ENVY_MANAGED_VENV"
+}}
+if ($env:PATH -ne $origPath) {{
+    throw "PATH was not rolled back to original after activation failure!`nNow: $env:PATH`nOrig: $origPath"
+}}
+if (Get-Command deactivate -ErrorAction SilentlyContinue) {{
+    throw "deactivate function was left behind after activation failure"
+}}
+
+# Repeated prompt in broken_proj -> no repeated crashes or loops
+$out1_repeat = [string](prompt)
+if ($env:VIRTUAL_ENV) {{ throw "VIRTUAL_ENV set on repeat in broken proj" }}
+
+# --- 2. Repair broken_proj and re-enter -> succeeds ---
+$repairActivate = @'
+{valid_activate.replace("__VENV_DIR__", str(broken_proj / ".venv")).replace("__BIN_DIR__", str(broken_proj / ".venv" / "Scripts"))}
+'@
+Set-Content -Path '{broken_proj / ".venv" / "Scripts" / "Activate.ps1"}' -Value $repairActivate
+
+Set-Location '{no_venv}'
+$null = prompt
+Set-Location '{broken_proj}'
+$out2 = [string](prompt)
+if (-not $out2.Contains("envy: venv loaded")) {{
+    throw "Repaired environment was not loaded on re-entry, got: $out2"
+}}
+if ($env:VIRTUAL_ENV -ne '{broken_proj / ".venv"}') {{
+    throw "Repaired environment VIRTUAL_ENV not set, got: $env:VIRTUAL_ENV"
+}}
+
+# --- 3. Switch from valid environment to a broken environment ---
+Set-Location '{proj_a}'
+$out3 = [string](prompt)
+if (-not $out3.Contains("envy: venv loaded")) {{
+    throw "projA not loaded, got: $out3"
+}}
+
+# Make broken_proj failing again
+$failActivateAgain = @'
+{failing_activate.replace("__VENV_DIR__", str(broken_proj / ".venv")).replace("__BIN_DIR__", str(broken_proj / ".venv" / "Scripts"))}
+'@
+Set-Content -Path '{broken_proj / ".venv" / "Scripts" / "Activate.ps1"}' -Value $failActivateAgain
+
+Set-Location '{broken_proj}'
+$out4 = [string](prompt)
+if (-not $out4.Contains("envy: venv unloaded")) {{
+    throw "projA was not unloaded when switching to broken project, got: $out4"
+}}
+if ($out4.Contains("envy: venv loaded")) {{
+    throw "broken project reported as loaded, got: $out4"
+}}
+if ($env:VIRTUAL_ENV) {{
+    throw "VIRTUAL_ENV not empty after switching to broken project: $env:VIRTUAL_ENV"
+}}
+if ($global:ENVY_MANAGED_VENV) {{
+    throw "ENVY_MANAGED_VENV not empty after switching to broken project: $global:ENVY_MANAGED_VENV"
+}}
+if ($env:PATH -ne $origPath) {{
+    throw "PATH not restored after switching to broken project"
+}}
+
+# --- 4. Active .venv directory deleted while inside project ---
+Set-Location '{proj_a}'
+$null = prompt
+if ($env:VIRTUAL_ENV -ne '{proj_a / ".venv"}') {{
+    throw "projA failed to activate"
+}}
+Remove-Item -Recurse -Force '{proj_a / ".venv"}'
+$out5 = [string](prompt)
+if (-not $out5.Contains("envy: venv unloaded")) {{
+    throw "Expected 'envy: venv unloaded' after deleting .venv, got: $out5"
+}}
+if ($env:VIRTUAL_ENV) {{
+    throw "VIRTUAL_ENV was not cleared after .venv was deleted, got: $env:VIRTUAL_ENV"
+}}
+if ($global:ENVY_MANAGED_VENV) {{
+    throw "ENVY_MANAGED_VENV was not cleared after .venv was deleted, got: $global:ENVY_MANAGED_VENV"
+}}
+if ($env:PATH -ne $origPath) {{
+    throw "PATH was not restored to original after deleting active .venv"
+}}
+
+# --- 5. Active interpreter deleted while inside project ---
+Set-Location '{proj_b}'
+$null = prompt
+if ($env:VIRTUAL_ENV -ne '{proj_b / ".venv"}') {{
+    throw "projB failed to activate"
+}}
+Remove-Item -Force '{proj_b / ".venv" / "Scripts" / "python.exe"}'
+$out6 = [string](prompt)
+if (-not $out6.Contains("envy: venv unloaded")) {{
+    throw "Expected 'envy: venv unloaded' after deleting interpreter, got: $out6"
+}}
+if ($env:VIRTUAL_ENV) {{
+    throw "VIRTUAL_ENV was not cleared after interpreter was deleted, got: $env:VIRTUAL_ENV"
+}}
+if ($global:ENVY_MANAGED_VENV) {{
+    throw "ENVY_MANAGED_VENV was not cleared after interpreter was deleted, got: $global:ENVY_MANAGED_VENV"
+}}
+
+# --- 6. Active activation script deleted while inside project ---
+# Recreate interpreter for projB first
+[System.IO.File]::WriteAllBytes('{proj_b / ".venv" / "Scripts" / "python.exe"}', [System.Convert]::FromBase64String('{__import__("base64").b64encode(dummy_pe).decode("ascii")}'))
+
+Set-Location '{no_venv}'
+$null = prompt
+Set-Location '{proj_b}'
+$null = prompt
+if ($env:VIRTUAL_ENV -ne '{proj_b / ".venv"}') {{
+    throw "projB failed to activate before deleting Activate.ps1"
+}}
+Remove-Item -Force '{proj_b / ".venv" / "Scripts" / "Activate.ps1"}'
+$out6b = [string](prompt)
+if (-not $out6b.Contains("envy: venv unloaded")) {{
+    throw "Expected 'envy: venv unloaded' after deleting Activate.ps1, got: $out6b"
+}}
+if ($env:VIRTUAL_ENV) {{
+    throw "VIRTUAL_ENV was not cleared after Activate.ps1 was deleted, got: $env:VIRTUAL_ENV"
+}}
+if ($global:ENVY_MANAGED_VENV) {{
+    throw "ENVY_MANAGED_VENV was not cleared after Activate.ps1 was deleted, got: $global:ENVY_MANAGED_VENV"
+}}
+
+# --- 7. Function preservation: pre-existing deactivate function exact restoration ---
+function global:deactivate {{ 'CUSTOM_DEACTIVATE_ACTIVE' }}
+
+# Case A: Failing activation preserves pre-existing deactivate function
+Set-Location '{no_venv}'
+$null = prompt
+Set-Location '{broken_proj}'
+$null = prompt
+$postFailDeact = (deactivate)
+if ($postFailDeact -ne 'CUSTOM_DEACTIVATE_ACTIVE') {{
+    throw "Pre-existing deactivate function was lost after activation failure! Got: $postFailDeact"
+}}
+
+# Re-create valid Activate.ps1 for projB
+$recreateActivateB = @'
+{valid_activate.replace("__VENV_DIR__", str(proj_b / ".venv")).replace("__BIN_DIR__", str(proj_b / ".venv" / "Scripts"))}
+'@
+Set-Content -Path '{proj_b / ".venv" / "Scripts" / "Activate.ps1"}' -Value $recreateActivateB
+
+# Case B: Successful activation and subsequent deactivation restores original deactivate function
+Set-Location '{no_venv}'
+$null = prompt
+Set-Location '{proj_b}'
+$null = prompt
+if ($env:VIRTUAL_ENV -ne '{proj_b / ".venv"}') {{
+    throw "projB failed to activate in function preservation test"
+}}
+Set-Location '{no_venv}'
+$null = prompt
+$postUnloadDeact = (deactivate)
+if ($postUnloadDeact -ne 'CUSTOM_DEACTIVATE_ACTIVE') {{
+    throw "Pre-existing deactivate function was lost after managed venv unloaded! Got: $postUnloadDeact"
+}}
+
+# Case C: Explicit manual deactivation restores original deactivate function
+Set-Location '{proj_b}'
+$null = prompt
+if ($env:VIRTUAL_ENV -ne '{proj_b / ".venv"}') {{
+    throw "projB failed to activate for manual deactivation test"
+}}
+deactivate
+$null = prompt
+$postManualDeact = (deactivate)
+if ($postManualDeact -ne 'CUSTOM_DEACTIVATE_ACTIVE') {{
+    throw "Pre-existing deactivate function was lost after manual deactivation! Got: $postManualDeact"
+}}
+# Sticky deactivation: should NOT reactivate on repeat in same directory
+$null = prompt
+if ($env:VIRTUAL_ENV) {{
+    throw "Envy reactivated immediately after manual deactivation in same dir!"
+}}
+
+# Case D: Re-entering project after manual deactivation re-activates, and subsequent unload preserves original function
+Set-Location '{no_venv}'
+$null = prompt
+Set-Location '{proj_b}'
+$null = prompt
+if ($env:VIRTUAL_ENV -ne '{proj_b / ".venv"}') {{
+    throw "projB failed to re-activate after re-entry!"
+}}
+Set-Location '{no_venv}'
+$null = prompt
+$postReenterDeact = (deactivate)
+if ($postReenterDeact -ne 'CUSTOM_DEACTIVATE_ACTIVE') {{
+    throw "Pre-existing deactivate function was lost after re-entry activation/unload! Got: $postReenterDeact"
+}}
+Remove-Item function:deactivate -ErrorAction SilentlyContinue
+
+# --- 9. PowerShell rejecting a Linux-only environment health check ---
+Set-Location '{linux_only_proj}'
+$null = prompt
+if ($env:VIRTUAL_ENV -or $global:ENVY_MANAGED_VENV) {{
+    throw "PowerShell hook accepted a Linux-only environment!"
+}}
+
+# --- 10. Repeated activation/deactivation cycles: PATH stability ---
+# Recreate interpreter for projB
+[System.IO.File]::WriteAllBytes('{proj_b / ".venv" / "Scripts" / "python.exe"}', [System.Convert]::FromBase64String('{__import__("base64").b64encode(dummy_pe).decode("ascii")}'))
+
+Set-Location '{no_venv}'
+$null = prompt
+$preLoopPath = $env:PATH
+
+for ($i = 0; $i -lt 10; $i++) {{
+    Set-Location '{proj_b}'
+    $null = prompt
+    Set-Location '{no_venv}'
+    $null = prompt
+}}
+
+if ($env:PATH -ne $preLoopPath) {{
+    throw "PATH accumulated duplicate entries during 10 activation/deactivation cycles!`nInitial: $preLoopPath`nFinal: $env:PATH"
+}}
+
+Write-Output "ALL_POWERSHELL_LIFECYCLE_RELIABILITY_TESTS_PASSED"
+"""
+            test_file = base / "run_lifecycle_test.ps1"
+            test_file.write_text(test_script, encoding="utf-8")
+
+            res = subprocess.run(
+                [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(test_file)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(res.returncode, 0, f"Lifecycle reliability test failed with stderr: {res.stderr}\nstdout: {res.stdout}")
+            self.assertIn("ALL_POWERSHELL_LIFECYCLE_RELIABILITY_TESTS_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

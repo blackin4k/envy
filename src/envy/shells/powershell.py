@@ -13,6 +13,8 @@ if ($global:__envy_hooked -ne 1) {
     $global:ENVY_MANAGED_VENV = $null
     $global:ENVY_DEACTIVATED_DIR = $null
     $global:ENVY_FAILED_DIR = $null
+    $global:__ENVY_PREV_PATH = $null
+    $global:__ENVY_SAVED_DEACTIVATE = $null
     $global:__envy_oldpwd = $null
     $global:__envy_prompt_old = $function:prompt
 
@@ -40,6 +42,53 @@ if ($global:__envy_hooked -ne 1) {
         return $null
     }
 
+    function global:__envy_deactivate {
+        param($Notifications = $null)
+        if ($global:ENVY_MANAGED_VENV) {
+            $deactivated = $false
+            if (Get-Command deactivate -ErrorAction SilentlyContinue) {
+                try {
+                    deactivate
+                    $deactivated = $true
+                } catch {
+                    $deactivated = $false
+                }
+            }
+
+            # Fallback cleanup in case deactivate was missing or failed to clean up
+            if (Test-Path Env:_OLD_VIRTUAL_PATH) {
+                Copy-Item -Path Env:_OLD_VIRTUAL_PATH -Destination Env:PATH
+                Remove-Item -Path Env:_OLD_VIRTUAL_PATH -ErrorAction SilentlyContinue
+            } elseif ($global:__ENVY_PREV_PATH) {
+                $env:PATH = $global:__ENVY_PREV_PATH
+            }
+
+            if (Test-Path Env:_OLD_VIRTUAL_PYTHONHOME) {
+                Copy-Item -Path Env:_OLD_VIRTUAL_PYTHONHOME -Destination Env:PYTHONHOME
+                Remove-Item -Path Env:_OLD_VIRTUAL_PYTHONHOME -ErrorAction SilentlyContinue
+            }
+
+            Remove-Item env:VIRTUAL_ENV -ErrorAction SilentlyContinue
+            Remove-Item env:VIRTUAL_ENV_PROMPT -ErrorAction SilentlyContinue
+            Remove-Item function:_OLD_VIRTUAL_PROMPT -ErrorAction SilentlyContinue
+            Remove-Variable _PYTHON_VENV_PROMPT_PREFIX -Scope Global -Force -ErrorAction SilentlyContinue
+            $global:__ENVY_PREV_PATH = $null
+
+            # Restore pre-existing deactivate function if there was one; otherwise ensure cleanup
+            if ($null -ne $global:__ENVY_SAVED_DEACTIVATE) {
+                ${function:global:deactivate} = $global:__ENVY_SAVED_DEACTIVATE
+                $global:__ENVY_SAVED_DEACTIVATE = $null
+            } else {
+                Remove-Item function:deactivate -ErrorAction SilentlyContinue
+            }
+
+            $global:ENVY_MANAGED_VENV = $null
+            if ($null -ne $Notifications) {
+                $null = $Notifications.Add("envy: venv unloaded")
+            }
+        }
+    }
+
     function global:__envy_hook {
         param($Notifications = $null)
         $dir = __envy_pwd
@@ -61,10 +110,20 @@ if ($global:__envy_hooked -ne 1) {
         if ($managedVenv -and -not $activeVenv) {
             $global:ENVY_DEACTIVATED_DIR = $dir
             $global:ENVY_MANAGED_VENV = $null
+            if ($null -ne $global:__ENVY_SAVED_DEACTIVATE) {
+                ${function:global:deactivate} = $global:__ENVY_SAVED_DEACTIVATE
+                $global:__ENVY_SAVED_DEACTIVATE = $null
+            }
         }
 
         # If directory has not changed and managed state matches environment, nothing to do
-        if ($dir -eq $global:__envy_oldpwd -and $managedVenv -eq $activeVenv) {
+        # BUT if managed venv, its Windows interpreter, or its Windows activation script was deleted on disk, do not return early
+        $venvValid = (-not $managedVenv -or (
+            (Test-Path $managedVenv -PathType Container) -and
+            (Test-Path (Join-Path $managedVenv "Scripts\python.exe")) -and
+            (Test-Path (Join-Path $managedVenv "Scripts\Activate.ps1"))
+        ))
+        if ($dir -eq $global:__envy_oldpwd -and $managedVenv -eq $activeVenv -and $venvValid) {
             return
         }
 
@@ -102,13 +161,7 @@ if ($global:__envy_hooked -ne 1) {
             $normResolved = $resolved.TrimEnd('\/')
             if ($managedVenv -ne $normResolved) {
                 # Deactivate previously managed venv if one was active
-                if ($managedVenv -and (Get-Command deactivate -ErrorAction SilentlyContinue)) {
-                    deactivate
-                    $global:ENVY_MANAGED_VENV = $null
-                    if ($null -ne $Notifications) {
-                        $null = $Notifications.Add("envy: venv unloaded")
-                    }
-                }
+                __envy_deactivate -Notifications $Notifications
 
                 $activateScript = Join-Path $resolved "Scripts\Activate.ps1"
                 if (-not (Test-Path $activateScript)) {
@@ -116,14 +169,27 @@ if ($global:__envy_hooked -ne 1) {
                 }
 
                 if (Test-Path $activateScript) {
+                    # Snapshot pre-activation state for rollback on failure
+                    $prePath = $env:PATH
+                    $preVirtualEnv = $env:VIRTUAL_ENV
+                    $preVirtualEnvPrompt = $env:VIRTUAL_ENV_PROMPT
+                    $prePythonHome = $env:PYTHONHOME
+                    $preDeactivate = if (Get-Command deactivate -ErrorAction SilentlyContinue) {
+                        ${function:deactivate}
+                    } else {
+                        $null
+                    }
+
                     $prevDisablePrompt = $env:VIRTUAL_ENV_DISABLE_PROMPT
                     $env:VIRTUAL_ENV_DISABLE_PROMPT = 1
-                    $activated = $false
+                    $actOk = $false
                     try {
                         . $activateScript
-                        $activated = $true
+                        if ($env:VIRTUAL_ENV) {
+                            $actOk = $true
+                        }
                     } catch {
-                        Write-Warning "Envy failed to activate environment at '$resolved': $_"
+                        $actOk = $false
                     } finally {
                         if ($null -eq $prevDisablePrompt) {
                             Remove-Item env:VIRTUAL_ENV_DISABLE_PROMPT -ErrorAction SilentlyContinue
@@ -132,29 +198,58 @@ if ($global:__envy_hooked -ne 1) {
                         }
                     }
 
-                    if ($activated) {
+                    if ($actOk) {
                         $global:ENVY_MANAGED_VENV = if ($env:VIRTUAL_ENV) { $env:VIRTUAL_ENV.TrimEnd('\/') } else { $normResolved }
+                        $global:__ENVY_PREV_PATH = $prePath
+                        $global:__ENVY_SAVED_DEACTIVATE = $preDeactivate
                         $global:ENVY_FAILED_DIR = $null
                         if ($null -ne $Notifications) {
                             $null = $Notifications.Add("envy: venv loaded")
                         }
                     } else {
+                        # Rollback on activation failure
+                        if (Get-Command deactivate -ErrorAction SilentlyContinue) {
+                            try { deactivate } catch { }
+                        }
+                        $env:PATH = $prePath
+                        if ($preVirtualEnv) {
+                            $env:VIRTUAL_ENV = $preVirtualEnv
+                        } else {
+                            Remove-Item env:VIRTUAL_ENV -ErrorAction SilentlyContinue
+                        }
+                        if ($preVirtualEnvPrompt) {
+                            $env:VIRTUAL_ENV_PROMPT = $preVirtualEnvPrompt
+                        } else {
+                            Remove-Item env:VIRTUAL_ENV_PROMPT -ErrorAction SilentlyContinue
+                        }
+                        if ($prePythonHome) {
+                            $env:PYTHONHOME = $prePythonHome
+                        } else {
+                            Remove-Item env:PYTHONHOME -ErrorAction SilentlyContinue
+                        }
+                        Remove-Item env:_OLD_VIRTUAL_PATH -ErrorAction SilentlyContinue
+                        Remove-Item env:_OLD_VIRTUAL_PYTHONHOME -ErrorAction SilentlyContinue
+                        Remove-Item function:_OLD_VIRTUAL_PROMPT -ErrorAction SilentlyContinue
+                        Remove-Variable _PYTHON_VENV_PROMPT_PREFIX -Scope Global -Force -ErrorAction SilentlyContinue
+                        $global:__ENVY_PREV_PATH = $null
+
+                        # Restore pre-existing deactivate function if there was one; otherwise ensure cleanup
+                        if ($null -ne $preDeactivate) {
+                            ${function:global:deactivate} = $preDeactivate
+                        } else {
+                            Remove-Item function:deactivate -ErrorAction SilentlyContinue
+                        }
+                        $global:__ENVY_SAVED_DEACTIVATE = $null
+
                         $global:ENVY_FAILED_DIR = $dir
                         $global:ENVY_MANAGED_VENV = $null
+                        [Console]::Error.WriteLine("envy: failed to activate environment at '$resolved'")
                     }
                 }
             }
         } else {
             # No venv found for this directory; deactivate managed venv if one was active
-            if ($managedVenv) {
-                if (Get-Command deactivate -ErrorAction SilentlyContinue) {
-                    deactivate
-                }
-                $global:ENVY_MANAGED_VENV = $null
-                if ($null -ne $Notifications) {
-                    $null = $Notifications.Add("envy: venv unloaded")
-                }
-            }
+            __envy_deactivate -Notifications $Notifications
         }
     }
 
