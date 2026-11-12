@@ -431,6 +431,37 @@ if ($null -eq $global:ENVY_FAILED_DIR) {{
 # Second prompt in broken dir should not re-attempt throwing
 $null = prompt
 
+# Test 4: Switching from valid parent into a child project with an invalid environment
+$corruptedChild = Join-Path '{parent_dir}' 'corrupted_child'
+$corrScripts = Join-Path $corruptedChild '.venv/Scripts'
+New-Item -ItemType Directory -Path $corrScripts -Force | Out-Null
+New-Item -ItemType File -Path (Join-Path $corrScripts 'Activate.ps1') -Force | Out-Null
+New-Item -ItemType File -Path (Join-Path $corrScripts 'python.exe') -Force | Out-Null # 0 bytes
+
+# Re-activate parent
+Set-Location '{parent_dir}'
+$null = prompt
+if ($env:VIRTUAL_ENV -ne '{parent_dir / ".venv"}') {{
+    throw "Failed to re-activate parent venv before corrupted child test"
+}}
+
+# Enter corrupted child: must deactivate parent and not activate child
+Set-Location $corruptedChild
+$null = prompt
+if ($env:VIRTUAL_ENV) {{
+    throw "Expected VIRTUAL_ENV to be unset in corrupted child, got: $env:VIRTUAL_ENV"
+}}
+if ($global:ENVY_MANAGED_VENV) {{
+    throw "Expected ENVY_MANAGED_VENV to be unset in corrupted child, got: $global:ENVY_MANAGED_VENV"
+}}
+
+# Return to parent: must restore parent venv
+Set-Location '{parent_dir}'
+$null = prompt
+if ($env:VIRTUAL_ENV -ne '{parent_dir / ".venv"}') {{
+    throw "Failed to re-activate parent venv after returning from corrupted child"
+}}
+
 Write-Output "ALL_EDGE_CASE_TESTS_PASSED"
 """
             edge_test_file = base / "run_edge_test.ps1"
@@ -444,6 +475,226 @@ Write-Output "ALL_EDGE_CASE_TESTS_PASSED"
 
             self.assertEqual(res.returncode, 0, f"Edge tests failed with stderr: {res.stderr}\nstdout: {res.stdout}")
             self.assertIn("ALL_EDGE_CASE_TESTS_PASSED", res.stdout)
+
+    @unittest.skipUnless(sys.platform == "win32", "PowerShell tests require Windows")
+    def test_powershell_resolver_diagnostic_visibility(self):
+        """Verify resolver diagnostics visibility, idempotency, and clean stdout in PowerShell."""
+        pwsh = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not pwsh:
+            self.skipTest("powershell executable not found")
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+
+            valid_proj = base / "valid_proj"
+            invalid_interp_proj = base / "invalid_interp_proj"
+            missing_act_proj = base / "missing_act_proj"
+            parent_proj = base / "parent_proj"
+            broken_child = parent_proj / "broken_child"
+            no_venv = base / "no_venv"
+
+            for d in (valid_proj, invalid_interp_proj, missing_act_proj, parent_proj, broken_child, no_venv):
+                d.mkdir(parents=True, exist_ok=True)
+
+            simple_activate = """
+function global:deactivate ([switch]$NonDestructive) {
+    Remove-Item env:VIRTUAL_ENV -ErrorAction SilentlyContinue
+    if (-not $NonDestructive) { Remove-Item -Path function:deactivate -ErrorAction SilentlyContinue }
+}
+deactivate -nondestructive
+$env:VIRTUAL_ENV = "__DIR__"
+"""
+            dummy_pe = make_dummy_pe()
+
+            def setup_ps_venv(proj_dir, valid_exe=True, has_act=True):
+                scripts = proj_dir / ".venv" / "Scripts"
+                scripts.mkdir(parents=True, exist_ok=True)
+                if has_act:
+                    (scripts / "Activate.ps1").write_text(simple_activate.replace("__DIR__", str(proj_dir / ".venv")), encoding="utf-8")
+                if valid_exe:
+                    (scripts / "python.exe").write_bytes(dummy_pe)
+                else:
+                    (scripts / "python.exe").touch()
+
+            # 1. Valid project
+            setup_ps_venv(valid_proj, valid_exe=True, has_act=True)
+            # 2. Invalid interpreter: 0-byte python.exe
+            setup_ps_venv(invalid_interp_proj, valid_exe=False, has_act=True)
+            # 3. Missing activation script
+            setup_ps_venv(missing_act_proj, valid_exe=True, has_act=False)
+            # 4. Parent project with broken child
+            setup_ps_venv(parent_proj, valid_exe=True, has_act=True)
+            setup_ps_venv(broken_child, valid_exe=False, has_act=True)
+
+            sibling_envy = Path(sys.executable).parent / "envy.exe"
+            envy_bin = str(sibling_envy) if sibling_envy.is_file() else "envy"
+
+            hook_code = get_powershell_hook(envy_bin=envy_bin)
+            hook_file = base / "envy_hook.ps1"
+            hook_file.write_text(hook_code, encoding="utf-8")
+
+            diag_test_script = f"""
+$ErrorActionPreference = 'Stop'
+
+function global:prompt {{ 'PS> ' }}
+. '{hook_file}'
+
+$outFile = '{base / "out.txt"}'
+$errFile = '{base / "err.txt"}'
+
+function Run-Prompt {{
+    Clear-Content $outFile -ErrorAction SilentlyContinue
+    Clear-Content $errFile -ErrorAction SilentlyContinue
+
+    # Execute prompt capturing stdout and stderr separately
+    $promptOutput = (prompt 2> $errFile)
+    [System.IO.File]::WriteAllText($outFile, "$promptOutput")
+}}
+
+function Read-Out {{
+    if (Test-Path $outFile) {{
+        $t = (Get-Content $outFile -Raw)
+        if ($null -ne $t) {{ return $t.Trim() }}
+    }}
+    return ""
+}}
+
+function Read-Err {{
+    if (Test-Path $errFile) {{
+        $t = (Get-Content $errFile -Raw)
+        if ($null -ne $t) {{ return $t.Trim() }}
+    }}
+    return ""
+}}
+
+# --- 1. Entering valid project ---
+Set-Location '{valid_proj}'
+Run-Prompt
+$out1 = Read-Out
+$err1 = Read-Err
+if ($env:VIRTUAL_ENV -ne '{valid_proj / ".venv"}') {{
+    throw "Expected VIRTUAL_ENV to be valid_proj, got: $env:VIRTUAL_ENV"
+}}
+if ($out1 -notlike "*envy: venv loaded*") {{
+    throw "Expected 'envy: venv loaded' in prompt output, got: $out1"
+}}
+if ($err1) {{
+    throw "Expected no stderr diagnostics for valid environment, got: $err1"
+}}
+
+# --- 2. Entering invalid interpreter project ---
+Set-Location '{invalid_interp_proj}'
+Run-Prompt
+$out2 = Read-Out
+$err2 = Read-Err
+if ($env:VIRTUAL_ENV) {{
+    throw "Expected VIRTUAL_ENV to be unset for invalid interpreter, got: $env:VIRTUAL_ENV"
+}}
+if ($out2 -notlike "*envy: venv unloaded*") {{
+    throw "Expected previous venv unloaded in prompt output, got: $out2"
+}}
+if ($err2 -notlike "*envy: error:*" -or $err2 -notlike "*empty*") {{
+    throw "Expected 'empty' diagnostic on stderr, got: $err2"
+}}
+
+# --- 3. Repeated prompt in broken project -> NO repeated diagnostics ---
+Run-Prompt
+$out3 = Read-Out
+$err3 = Read-Err
+if ($err3) {{
+    throw "Expected no repeat diagnostic on repeat prompt, got: $err3"
+}}
+if ($out3 -like "*envy:*") {{
+    throw "Expected no repeated notifications on repeat prompt, got: $out3"
+}}
+
+# --- 4. Entering missing activation script project ---
+Set-Location '{missing_act_proj}'
+Run-Prompt
+$err4 = Read-Err
+if ($env:VIRTUAL_ENV) {{
+    throw "Expected VIRTUAL_ENV to be unset for missing activation script"
+}}
+if ($err4 -notlike "*envy: error:*" -or $err4 -notlike "*activation script*") {{
+    throw "Expected missing activation script diagnostic on stderr, got: $err4"
+}}
+
+# --- 5. Switching from valid parent into broken child ---
+Set-Location '{parent_proj}'
+Run-Prompt
+if ($env:VIRTUAL_ENV -ne '{parent_proj / ".venv"}') {{
+    throw "Expected parent venv activated"
+}}
+
+Set-Location '{broken_child}'
+Run-Prompt
+$out5 = Read-Out
+$err5 = Read-Err
+if ($env:VIRTUAL_ENV) {{
+    throw "Expected VIRTUAL_ENV to be unset in broken child, got: $env:VIRTUAL_ENV"
+}}
+if ($global:ENVY_MANAGED_VENV) {{
+    throw "Expected ENVY_MANAGED_VENV to be unset in broken child, got: $global:ENVY_MANAGED_VENV"
+}}
+if ($out5 -notlike "*envy: venv unloaded*") {{
+    throw "Expected parent venv unloaded notification, got: $out5"
+}}
+if ($err5 -notlike "*envy: error:*" -or $err5 -notlike "*empty*") {{
+    throw "Expected child diagnostic on stderr, got: $err5"
+}}
+
+# Repeated prompt in broken child -> no repeated diagnostic
+Run-Prompt
+$err5_repeat = Read-Err
+if ($err5_repeat) {{
+    throw "Expected no repeat diagnostic in broken child, got: $err5_repeat"
+}}
+
+# --- 6. Repairing the environment and re-entering the project ---
+$repairedExe = Join-Path '{invalid_interp_proj / ".venv/Scripts"}' 'python.exe'
+[System.IO.File]::WriteAllBytes($repairedExe, [System.IO.File]::ReadAllBytes('{valid_proj / ".venv/Scripts/python.exe"}'))
+
+Set-Location '{no_venv}'
+Run-Prompt
+
+Set-Location '{invalid_interp_proj}'
+Run-Prompt
+$out6 = Read-Out
+$err6 = Read-Err
+if ($env:VIRTUAL_ENV -ne '{invalid_interp_proj / ".venv"}') {{
+    throw "Expected repaired venv to be active, got: $env:VIRTUAL_ENV"
+}}
+if ($out6 -notlike "*envy: venv loaded*") {{
+    throw "Expected 'envy: venv loaded' after repairing venv, got: $out6"
+}}
+if ($err6) {{
+    throw "Expected NO stderr diagnostics after repairing venv, got: $err6"
+}}
+
+# --- 7. Verify ErrorActionPreference and LASTEXITCODE preservation ---
+if ($ErrorActionPreference -ne 'Stop') {{
+    throw "ErrorActionPreference was modified by hook, now: $ErrorActionPreference"
+}}
+
+powershell -Command 'exit 33'
+Run-Prompt
+if ($LASTEXITCODE -ne 33) {{
+    throw "LASTEXITCODE was not preserved by prompt, got: $LASTEXITCODE"
+}}
+
+Write-Output "ALL_POWERSHELL_DIAGNOSTIC_VISIBILITY_TESTS_PASSED"
+"""
+            diag_test_file = base / "run_diag_test.ps1"
+            diag_test_file.write_text(diag_test_script, encoding="utf-8")
+
+            res = subprocess.run(
+                [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(diag_test_file)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(res.returncode, 0, f"Diag test failed with stderr: {res.stderr}\nstdout: {res.stdout}")
+            self.assertIn("ALL_POWERSHELL_DIAGNOSTIC_VISIBILITY_TESTS_PASSED", res.stdout)
 
 
 if __name__ == "__main__":

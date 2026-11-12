@@ -72,7 +72,7 @@ if [[ -z "${__ENVY_HOOKED:-}" ]]; then
 
         # Query envy for the environment containing or nearest to current directory
         \builtin local resolved
-        resolved="$(__envy_bin resolve "${dir}" --shell bash 2>/dev/null)" || resolved=""
+        resolved="$(__envy_bin resolve "${dir}" --shell bash)" || resolved=""
         resolved="${resolved%%$'\r'}"
 
         if [[ -n "${resolved}" && -d "${resolved}" ]]; then

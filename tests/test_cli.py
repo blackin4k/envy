@@ -40,6 +40,54 @@ class TestCLI(unittest.TestCase):
                     main()
                 self.assertEqual(captured.getvalue().strip(), "")
 
+    def test_cli_resolve_broken_environment_reports_diagnostic_to_stderr(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            venv_dir = root / ".venv"
+            scripts_dir = venv_dir / ("Scripts" if sys.platform == "win32" else "bin")
+            scripts_dir.mkdir(parents=True)
+            (scripts_dir / ("Activate.ps1" if sys.platform == "win32" else "activate")).touch()
+            # 0-byte python interpreter is invalid
+            py_name = "python.exe" if sys.platform == "win32" else "python"
+            (scripts_dir / py_name).touch()
+
+            with patch("sys.argv", ["envy", "resolve", str(root)]):
+                captured_out = io.StringIO()
+                captured_err = io.StringIO()
+                with patch("sys.stdout", captured_out), patch("sys.stderr", captured_err):
+                    with self.assertRaises(SystemExit) as cm:
+                        main()
+                    self.assertEqual(cm.exception.code, 1)
+
+                # stdout must be empty to avoid activating broken venv
+                self.assertEqual(captured_out.getvalue().strip(), "")
+                # stderr must contain diagnostic message
+                self.assertIn("envy: error:", captured_err.getvalue())
+                self.assertIn("empty", captured_err.getvalue())
+
+    def test_cli_resolve_nested_nearest(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            parent_venv = root / ".venv"
+            child = root / "child"
+            child_venv = child / ".venv"
+
+            for venv in (parent_venv, child_venv):
+                sdir = venv / ("Scripts" if sys.platform == "win32" else "bin")
+                sdir.mkdir(parents=True)
+                (sdir / ("Activate.ps1" if sys.platform == "win32" else "activate")).touch()
+                if sys.platform == "win32":
+                    (sdir / "python.exe").write_bytes(make_dummy_pe())
+                else:
+                    (sdir / "python").write_bytes(make_dummy_elf())
+
+            # Resolving from child resolves child_venv
+            with patch("sys.argv", ["envy", "resolve", str(child)]):
+                captured = io.StringIO()
+                with patch("sys.stdout", captured):
+                    main()
+                self.assertEqual(captured.getvalue().strip(), str(child_venv))
+
     def test_cli_init_powershell(self):
         with patch("sys.argv", ["envy", "init", "powershell"]):
             captured = io.StringIO()

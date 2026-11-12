@@ -17,12 +17,18 @@ if ($global:__envy_hooked -ne 1) {
     $global:__envy_prompt_old = $function:prompt
 
     function global:__envy_bin {
-        if (Get-Command envy -ErrorAction SilentlyContinue) {
-            envy @args
-        } elseif (Test-Path "__ENVY_BIN_PATH__") {
-            & "__ENVY_BIN_PATH__" @args
-        } else {
-            Write-Error "envy binary not found in PATH or at __ENVY_BIN_PATH__"
+        $prevEA = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            if (Get-Command envy -ErrorAction SilentlyContinue) {
+                envy @args
+            } elseif (Test-Path "__ENVY_BIN_PATH__") {
+                & "__ENVY_BIN_PATH__" @args
+            } else {
+                Write-Error "envy binary not found in PATH or at __ENVY_BIN_PATH__"
+            }
+        } finally {
+            $ErrorActionPreference = $prevEA
         }
     }
 
@@ -83,7 +89,7 @@ if ($global:__envy_hooked -ne 1) {
         }
 
         # Query envy for the environment containing or nearest to current directory
-        $rawOutput = (__envy_bin resolve "$dir" 2>$null)
+        $rawOutput = (__envy_bin resolve "$dir")
         $resolved = $null
         if ($rawOutput) {
             $lines = ($rawOutput | Out-String).Trim() -split "`r?`n"

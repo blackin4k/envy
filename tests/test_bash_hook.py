@@ -347,6 +347,31 @@ cd "$PROJ_A"
 __envy_hook >/dev/null
 if [[ "$VIRTUAL_ENV" != "$PROJ_A/.venv" ]]; then echo "Failed to re-activate after re-entry" >&2; exit 1; fi
 
+# 8. Switching from valid parent into child project with an invalid/corrupted environment
+CORRUPTED_CHILD="$PROJ_A/corrupted_child"
+mkdir -p "$CORRUPTED_CHILD/.venv/bin"
+touch "$CORRUPTED_CHILD/.venv/bin/activate"
+touch "$CORRUPTED_CHILD/.venv/bin/python" # 0 bytes
+
+cd "$CORRUPTED_CHILD"
+__envy_hook >/dev/null
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    echo "Expected VIRTUAL_ENV to be unset in corrupted child, got: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+if [[ -n "$ENVY_MANAGED_VENV" ]]; then
+    echo "Expected ENVY_MANAGED_VENV to be unset in corrupted child, got: $ENVY_MANAGED_VENV" >&2
+    exit 1
+fi
+
+# Return to parent: must restore parent venv
+cd "$PROJ_A"
+__envy_hook >/dev/null
+if [[ "$VIRTUAL_ENV" != "$PROJ_A/.venv" ]]; then
+    echo "Failed to re-activate parent venv after returning from corrupted child" >&2
+    exit 1
+fi
+
 echo "ALL_WSL_BASH_LIFECYCLE_TESTS_PASSED"
 """.replace("__REPO_PATH__", repo_wsl_path).replace("\r\n", "\n")
 
@@ -373,9 +398,14 @@ mkdir -p "$WIN_PROJ/.venv/Scripts"
 touch "$WIN_PROJ/.venv/Scripts/activate"
 touch "$WIN_PROJ/.venv/Scripts/python.exe"
 
-RESOLVED_WIN=$(/usr/bin/python3 -m envy.cli resolve "$WIN_PROJ" --shell bash)
+# Verify resolve exits nonzero and outputs nothing on stdout
+RESOLVED_WIN=$(/usr/bin/python3 -m envy.cli resolve "$WIN_PROJ" --shell bash 2>/dev/null || true)
 if [[ -n "$RESOLVED_WIN" ]]; then
     echo "CROSS-ACTIVATION LEAK! WSL Envy resolved a Windows venv: $RESOLVED_WIN" >&2
+    exit 1
+fi
+if /usr/bin/python3 -m envy.cli resolve "$WIN_PROJ" --shell bash >/dev/null 2>&1; then
+    echo "Expected nonzero exit code when resolving Windows venv on Linux!" >&2
     exit 1
 fi
 
@@ -385,9 +415,13 @@ mkdir -p "$FAKE_PROJ/.venv/bin"
 touch "$FAKE_PROJ/.venv/bin/activate"
 printf 'MZ\\x90\\x00fake_windows_binary' > "$FAKE_PROJ/.venv/bin/python"
 
-RESOLVED_FAKE=$(/usr/bin/python3 -m envy.cli resolve "$FAKE_PROJ" --shell bash)
+RESOLVED_FAKE=$(/usr/bin/python3 -m envy.cli resolve "$FAKE_PROJ" --shell bash 2>/dev/null || true)
 if [[ -n "$RESOLVED_FAKE" ]]; then
     echo "NON-NATIVE INTERPRETER LEAK! WSL Envy resolved non-ELF python: $RESOLVED_FAKE" >&2
+    exit 1
+fi
+if /usr/bin/python3 -m envy.cli resolve "$FAKE_PROJ" --shell bash >/dev/null 2>&1; then
+    echo "Expected nonzero exit code when resolving fake binary venv on Linux!" >&2
     exit 1
 fi
 
@@ -413,6 +447,201 @@ echo "ALL_CROSS_ACTIVATION_AND_PRECEDENCE_TESTS_PASSED"
         res = subprocess.run([wsl, "bash"], input=script.encode("utf-8"), capture_output=True)
         self.assertEqual(res.returncode, 0, f"Failed: {res.stderr.decode('utf-8')}\nstdout: {res.stdout.decode('utf-8')}")
         self.assertIn("ALL_CROSS_ACTIVATION_AND_PRECEDENCE_TESTS_PASSED", res.stdout.decode("utf-8"))
+
+    @unittest.skipUnless(is_wsl_available(), "WSL Bash is required for this test")
+    def test_wsl_bash_resolver_diagnostic_visibility(self):
+        """Verify resolver diagnostics visibility, idempotency, and clean stdout in Bash."""
+        wsl = shutil.which("wsl.exe") or shutil.which("wsl") or "bash"
+        repo_wsl_path = "/mnt/c/Users/fasiu/envy"
+
+        script = """
+set -e
+TEST_DIR=$(mktemp -d /tmp/envy_bash_diag_XXXXXX)
+trap 'rm -rf "$TEST_DIR"' EXIT
+
+VALID_PROJ="$TEST_DIR/valid_proj"
+INVALID_INTERP_PROJ="$TEST_DIR/invalid_interp_proj"
+MISSING_ACT_PROJ="$TEST_DIR/missing_act_proj"
+PARENT_PROJ="$TEST_DIR/parent_proj"
+BROKEN_CHILD="$PARENT_PROJ/broken_child"
+NO_VENV="$TEST_DIR/no_venv"
+
+mkdir -p "$VALID_PROJ/.venv/bin" "$INVALID_INTERP_PROJ/.venv/bin" "$MISSING_ACT_PROJ/.venv/bin"
+mkdir -p "$PARENT_PROJ/.venv/bin" "$BROKEN_CHILD/.venv/bin" "$NO_VENV"
+
+create_activate() {
+    local venv_dir="$1"
+    local bin_dir="$venv_dir/bin"
+    cat << 'EOF' > "$bin_dir/activate"
+deactivate () {
+    unset VIRTUAL_ENV
+    if [ ! "${1-}" = "nondestructive" ] ; then
+        unset -f deactivate
+    fi
+}
+deactivate nondestructive
+VIRTUAL_ENV="__VENV_DIR__"
+export VIRTUAL_ENV
+EOF
+    sed -i "s|__VENV_DIR__|$venv_dir|g" "$bin_dir/activate"
+    ln -s /usr/bin/python3 "$bin_dir/python"
+}
+
+# 1. Valid environment
+create_activate "$VALID_PROJ/.venv"
+
+# 2. Invalid interpreter: 0-byte python binary
+create_activate "$INVALID_INTERP_PROJ/.venv"
+rm -f "$INVALID_INTERP_PROJ/.venv/bin/python"
+touch "$INVALID_INTERP_PROJ/.venv/bin/python"
+
+# 3. Missing activation script
+ln -s /usr/bin/python3 "$MISSING_ACT_PROJ/.venv/bin/python"
+
+# 4. Valid parent project with broken child project (0-byte interpreter)
+create_activate "$PARENT_PROJ/.venv"
+create_activate "$BROKEN_CHILD/.venv"
+rm -f "$BROKEN_CHILD/.venv/bin/python"
+touch "$BROKEN_CHILD/.venv/bin/python"
+
+cat << 'EOF' > "$TEST_DIR/envy_shim"
+#!/bin/bash
+exec /usr/bin/python3 -m envy.cli "$@"
+EOF
+chmod +x "$TEST_DIR/envy_shim"
+
+export PYTHONPATH="__REPO_PATH__/src"
+export ENVY_BIN="$TEST_DIR/envy_shim"
+
+HOOK_CODE=$(/usr/bin/python3 -m envy.cli init bash)
+eval "$HOOK_CODE"
+
+OUT_FILE="$TEST_DIR/stdout.txt"
+ERR_FILE="$TEST_DIR/stderr.txt"
+
+# --- 1. Entering a project with a valid environment ---
+cd "$VALID_PROJ"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+err=$(cat "$ERR_FILE")
+if [[ "$out" != "envy: venv loaded" ]]; then
+    echo "Expected 'envy: venv loaded' in stdout, got: '$out'" >&2
+    exit 1
+fi
+if [[ -n "$err" ]]; then
+    echo "Expected NO stderr diagnostics for valid environment, got: '$err'" >&2
+    exit 1
+fi
+if [[ "$VIRTUAL_ENV" != "$VALID_PROJ/.venv" ]]; then
+    echo "Expected VIRTUAL_ENV to be set to valid venv" >&2
+    exit 1
+fi
+
+# --- 2. Entering a project with an invalid interpreter ---
+cd "$INVALID_INTERP_PROJ"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+err=$(cat "$ERR_FILE")
+if [[ "$out" != "envy: venv unloaded" ]]; then
+    echo "Expected previous venv unloaded in stdout, got: '$out'" >&2
+    exit 1
+fi
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    echo "Expected VIRTUAL_ENV to be unset for invalid interpreter" >&2
+    exit 1
+fi
+if [[ "$err" != *"envy: error:"* || "$err" != *"is empty"* ]]; then
+    echo "Expected 'is empty' diagnostic on stderr, got: '$err'" >&2
+    exit 1
+fi
+
+# --- 3. Repeated prompt in the broken project -> NO repeated diagnostics ---
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+err=$(cat "$ERR_FILE")
+if [[ -n "$out" || -n "$err" ]]; then
+    echo "Expected no stdout or stderr on repeat prompt in invalid project, got out='$out', err='$err'" >&2
+    exit 1
+fi
+
+# --- 4. Entering a project with a missing activation script ---
+cd "$MISSING_ACT_PROJ"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+err=$(cat "$ERR_FILE")
+if [[ "$err" != *"envy: error:"* || "$err" != *"activation script"* ]]; then
+    echo "Expected missing activation script diagnostic on stderr, got: '$err'" >&2
+    exit 1
+fi
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    echo "Expected VIRTUAL_ENV to be unset for missing activation script" >&2
+    exit 1
+fi
+
+# --- 5. Switching from valid parent into broken child ---
+cd "$PARENT_PROJ"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+if [[ "$VIRTUAL_ENV" != "$PARENT_PROJ/.venv" ]]; then
+    echo "Expected parent venv activated" >&2
+    exit 1
+fi
+
+cd "$BROKEN_CHILD"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+err=$(cat "$ERR_FILE")
+if [[ "$out" != "envy: venv unloaded" ]]; then
+    echo "Expected parent venv unloaded when entering broken child, got: '$out'" >&2
+    exit 1
+fi
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    echo "Expected VIRTUAL_ENV to be unset in broken child, got: '$VIRTUAL_ENV'" >&2
+    exit 1
+fi
+if [[ "$err" != *"envy: error:"* || "$err" != *"is empty"* ]]; then
+    echo "Expected child diagnostic on stderr, got: '$err'" >&2
+    exit 1
+fi
+
+# Repeat prompt in broken child -> no repeated diagnostic
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+err=$(cat "$ERR_FILE")
+if [[ -n "$out" || -n "$err" ]]; then
+    echo "Expected no repeat diagnostic in broken child, got out='$out', err='$err'" >&2
+    exit 1
+fi
+
+# --- 6. Repairing the environment and re-entering the project ---
+rm -f "$INVALID_INTERP_PROJ/.venv/bin/python"
+ln -s /usr/bin/python3 "$INVALID_INTERP_PROJ/.venv/bin/python"
+
+cd "$NO_VENV"
+__envy_hook >/dev/null 2>&1
+
+cd "$INVALID_INTERP_PROJ"
+__envy_hook > "$OUT_FILE" 2> "$ERR_FILE"
+out=$(cat "$OUT_FILE")
+err=$(cat "$ERR_FILE")
+if [[ "$out" != "envy: venv loaded" ]]; then
+    echo "Expected 'envy: venv loaded' after repairing venv, got: '$out'" >&2
+    exit 1
+fi
+if [[ -n "$err" ]]; then
+    echo "Expected NO stderr diagnostic after repairing venv, got: '$err'" >&2
+    exit 1
+fi
+if [[ "$VIRTUAL_ENV" != "$INVALID_INTERP_PROJ/.venv" ]]; then
+    echo "Expected repaired venv to be active, got: '$VIRTUAL_ENV'" >&2
+    exit 1
+fi
+
+echo "ALL_BASH_DIAGNOSTIC_VISIBILITY_TESTS_PASSED"
+""".replace("__REPO_PATH__", repo_wsl_path).replace("\r\n", "\n")
+
+        res = subprocess.run([wsl, "bash"], input=script.encode("utf-8"), capture_output=True)
+        self.assertEqual(res.returncode, 0, f"Failed: {res.stderr.decode('utf-8')}\nstdout: {res.stdout.decode('utf-8')}")
+        self.assertIn("ALL_BASH_DIAGNOSTIC_VISIBILITY_TESTS_PASSED", res.stdout.decode("utf-8"))
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 import argparse
 from pathlib import Path
+import sys
 
-from envy.resolver import find_environment
+from envy.resolver import EnvironmentStatus, find_environment, resolve_environment
 from envy.shells.bash import get_bash_hook
 from envy.shells.powershell import get_powershell_hook
 
@@ -47,12 +48,16 @@ def main():
     args = parser.parse_args()
 
     if args.command == "resolve":
-        environment = find_environment(Path(args.path), shell=args.shell)
+        result = resolve_environment(Path(args.path), shell=args.shell)
 
-        if environment is None:
+        if result.status in (EnvironmentStatus.INVALID, EnvironmentStatus.INCOMPLETE):
+            sys.stderr.write(f"envy: error: {result.error_message}\n")
+            sys.exit(1)
+
+        if result.environment is None:
             return
 
-        print(environment)
+        print(result.environment)
 
     elif args.command == "init":
         if args.shell == "powershell":
