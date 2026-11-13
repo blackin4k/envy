@@ -1029,6 +1029,176 @@ echo "ALL_BASH_LIFECYCLE_RELIABILITY_TESTS_PASSED"
         self.assertEqual(res.returncode, 0, f"Failed: {res.stderr.decode('utf-8')}\nstdout: {res.stdout.decode('utf-8')}")
         self.assertIn("ALL_BASH_LIFECYCLE_RELIABILITY_TESTS_PASSED", res.stdout.decode("utf-8"))
 
+    @unittest.skipUnless(is_wsl_available(), "WSL Bash is required for this test")
+    def test_wsl_bash_subshell_initialization_and_isolation(self):
+        """Verify nested interactive Bash initialization, environment isolation, and inherited state."""
+        wsl = shutil.which("wsl.exe") or shutil.which("wsl") or "bash"
+        repo_wsl_path = "/mnt/c/Users/fasiu/envy"
+
+        script = r"""
+set -e
+TEST_DIR=$(mktemp -d /tmp/envy_bash_subshell_XXXXXX)
+trap 'rm -rf "$TEST_DIR"' EXIT
+
+PROJ_A="$TEST_DIR/projA"
+PROJ_B="$TEST_DIR/projB"
+NO_VENV="$TEST_DIR/no_venv"
+mkdir -p "$PROJ_A/.venv/bin" "$PROJ_B/.venv/bin" "$NO_VENV"
+
+create_activate() {
+    local venv_dir="$1"
+    local bin_dir="$venv_dir/bin"
+    cat << 'EOF' > "$bin_dir/activate"
+deactivate () {
+    if [ -n "${_OLD_VIRTUAL_PATH:-}" ] ; then
+        PATH="${_OLD_VIRTUAL_PATH}"
+        export PATH
+        unset _OLD_VIRTUAL_PATH
+    fi
+    unset VIRTUAL_ENV
+    if [ ! "${1-}" = "nondestructive" ] ; then
+        unset -f deactivate
+    fi
+}
+deactivate nondestructive
+VIRTUAL_ENV="__VENV_DIR__"
+export VIRTUAL_ENV
+_OLD_VIRTUAL_PATH="$PATH"
+PATH="$bin_dir:$PATH"
+export PATH
+EOF
+    sed -i "s|__VENV_DIR__|$venv_dir|g" "$bin_dir/activate"
+    ln -sf /usr/bin/python3 "$bin_dir/python"
+}
+
+create_activate "$PROJ_A/.venv"
+create_activate "$PROJ_B/.venv"
+
+cat << 'EOF' > "$TEST_DIR/envy_shim"
+#!/bin/bash
+exec /usr/bin/python3 -m envy.cli "$@"
+EOF
+chmod +x "$TEST_DIR/envy_shim"
+
+export PYTHONPATH="__REPO_PATH__/src"
+export ENVY_BIN="$TEST_DIR/envy_shim"
+
+CHILD_RC="$TEST_DIR/child_rc"
+cat << 'EOF' > "$CHILD_RC"
+export PYTHONPATH="__REPO_PATH__/src"
+export ENVY_BIN="__ENVY_BIN__"
+eval "$($ENVY_BIN init bash)"
+EOF
+sed -i "s|__REPO_PATH__|__REPO_PATH__|g" "$CHILD_RC"
+sed -i "s|__ENVY_BIN__|$TEST_DIR/envy_shim|g" "$CHILD_RC"
+
+# Generate hook for parent
+HOOK_CODE=$(/usr/bin/python3 -m envy.cli init bash)
+eval "$HOOK_CODE"
+
+cd "$PROJ_A"
+__envy_hook >/dev/null
+
+if [[ "$VIRTUAL_ENV" != "$PROJ_A/.venv" ]]; then
+    echo "Parent failed to activate projA: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+if [[ "$ENVY_MANAGED_VENV" != "$PROJ_A/.venv" ]]; then
+    echo "Parent ENVY_MANAGED_VENV not set: $ENVY_MANAGED_VENV" >&2
+    exit 1
+fi
+
+# Verify unexported bookkeeping variables are NOT in environment
+if env | grep -q "^__ENVY_HOOKED="; then
+    echo "__ENVY_HOOKED is exported in parent!" >&2
+    exit 1
+fi
+if env | grep -q "^ENVY_MANAGED_VENV="; then
+    echo "ENVY_MANAGED_VENV is exported in parent!" >&2
+    exit 1
+fi
+
+# Spawn interactive child shell with explicit startup configuration
+bash --noprofile --rcfile "$CHILD_RC" -i << EOF
+if ! type -t __envy_hook >/dev/null 2>&1; then
+    echo "Child shell failed to initialize envy hook!" >&2
+    exit 1
+fi
+if [[ "\$VIRTUAL_ENV" != "$PROJ_A/.venv" ]]; then
+    echo "Child did not inherit VIRTUAL_ENV from parent: \$VIRTUAL_ENV" >&2
+    exit 1
+fi
+if [[ -n "\$ENVY_MANAGED_VENV" ]]; then
+    echo "Child incorrectly inherited ENVY_MANAGED_VENV: \$ENVY_MANAGED_VENV" >&2
+    exit 1
+fi
+
+# Inherited venv is treated as manual user control in child: navigating does not overwrite it
+cd "$PROJ_B"
+__envy_hook >/dev/null
+if [[ "\$VIRTUAL_ENV" != "$PROJ_A/.venv" ]]; then
+    echo "Child did not respect manual/inherited venv on navigation: \$VIRTUAL_ENV" >&2
+    exit 1
+fi
+
+# Unsetting inherited VIRTUAL_ENV in child enables Envy auto-switching in child
+unset VIRTUAL_ENV
+__envy_hook >/dev/null
+
+# Entering projB in child now auto-activates projB under child Envy management
+cd "$NO_VENV"
+__envy_hook >/dev/null
+cd "$PROJ_B"
+__envy_hook >/dev/null
+if [[ "\$VIRTUAL_ENV" != "$PROJ_B/.venv" ]]; then
+    echo "Child failed to activate projB: \$VIRTUAL_ENV" >&2
+    exit 1
+fi
+if [[ "\$ENVY_MANAGED_VENV" != "$PROJ_B/.venv" ]]; then
+    echo "Child failed to manage projB: \$ENVY_MANAGED_VENV" >&2
+    exit 1
+fi
+exit 0
+EOF
+
+child_exit=$?
+if [[ $child_exit -ne 0 ]]; then
+    echo "Child shell exited with error: $child_exit" >&2
+    exit 1
+fi
+
+# Verify parent shell state remains 100% intact and uncorrupted
+if [[ "$VIRTUAL_ENV" != "$PROJ_A/.venv" ]]; then
+    echo "Parent VIRTUAL_ENV was corrupted by child! Now: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+if [[ "$ENVY_MANAGED_VENV" != "$PROJ_A/.venv" ]]; then
+    echo "Parent ENVY_MANAGED_VENV was corrupted by child! Now: $ENVY_MANAGED_VENV" >&2
+    exit 1
+fi
+
+# Parent can continue normal operations
+cd "$PROJ_B"
+__envy_hook >/dev/null
+if [[ "$VIRTUAL_ENV" != "$PROJ_B/.venv" ]]; then
+    echo "Parent failed to switch to projB: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+
+cd "$NO_VENV"
+__envy_hook >/dev/null
+if [[ -n "$VIRTUAL_ENV" ]]; then
+    echo "Parent failed to deactivate in no_venv: $VIRTUAL_ENV" >&2
+    exit 1
+fi
+
+echo "ALL_BASH_SUBSHELL_TESTS_PASSED"
+""".replace("__REPO_PATH__", repo_wsl_path).replace("\r\n", "\n")
+
+        res = subprocess.run([wsl, "bash"], input=script.encode("utf-8"), capture_output=True)
+        self.assertEqual(res.returncode, 0, f"Failed: {res.stderr.decode('utf-8')}\nstdout: {res.stdout.decode('utf-8')}")
+        self.assertIn("ALL_BASH_SUBSHELL_TESTS_PASSED", res.stdout.decode("utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

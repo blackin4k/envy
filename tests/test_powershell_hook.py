@@ -1020,6 +1020,155 @@ Write-Output "ALL_POWERSHELL_LIFECYCLE_RELIABILITY_TESTS_PASSED"
             self.assertEqual(res.returncode, 0, f"Lifecycle reliability test failed with stderr: {res.stderr}\nstdout: {res.stdout}")
             self.assertIn("ALL_POWERSHELL_LIFECYCLE_RELIABILITY_TESTS_PASSED", res.stdout)
 
+    @unittest.skipUnless(sys.platform == "win32", "PowerShell tests require Windows")
+    def test_powershell_stage_c_compatibility(self):
+        """Verify PowerShell re-sourcing resilience, Push/Pop-Location, array prompt, and Unicode navigation."""
+        pwsh = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not pwsh:
+            self.skipTest("powershell executable not found")
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            proj_a = base / "projA"
+            proj_b = base / "projB"
+            unicode_proj = base / "proj_ünicöde_🎉"
+            no_venv = base / "no_venv"
+
+            for d in (proj_a, proj_b, unicode_proj, no_venv):
+                d.mkdir(parents=True, exist_ok=True)
+
+            dummy_pe = make_dummy_pe()
+            act_ps1 = """
+function global:deactivate ([switch]$NonDestructive) {
+    Remove-Item env:VIRTUAL_ENV -ErrorAction SilentlyContinue
+    if (-not $NonDestructive) { Remove-Item -Path function:deactivate }
+}
+deactivate -nondestructive
+$env:VIRTUAL_ENV = "__DIR__"
+"""
+            for p in (proj_a, proj_b, unicode_proj):
+                s = p / ".venv" / "Scripts"
+                s.mkdir(parents=True, exist_ok=True)
+                (s / "python.exe").write_bytes(dummy_pe)
+                (s / "Activate.ps1").write_text(act_ps1.replace("__DIR__", str(p / ".venv")), encoding="utf-8-sig")
+
+            sibling_envy = Path(sys.executable).parent / "envy.exe"
+            envy_bin = str(sibling_envy) if sibling_envy.is_file() else "envy"
+            hook_code = get_powershell_hook(envy_bin=envy_bin)
+            hook_file = base / "envy_hook.ps1"
+            hook_file.write_text(hook_code, encoding="utf-8-sig")
+
+            test_script = f"""
+$ErrorActionPreference = 'Stop'
+Remove-Item env:VIRTUAL_ENV -ErrorAction SilentlyContinue
+
+# --- 1. Array / multiline prompt output ---
+function global:prompt {{
+    return @("PROMPT_LINE1", "PROMPT_LINE2", "PS> ")
+}}
+. '{hook_file}'
+
+Set-Location '{proj_a}'
+$pOut1 = (prompt)
+if ($pOut1 -notlike "*envy: venv loaded*") {{
+    throw "Notification not found in array prompt output: $pOut1"
+}}
+if ($pOut1 -notlike "*PROMPT_LINE1*PROMPT_LINE2*PS> *") {{
+    throw "Array prompt lines were not joined correctly: $pOut1"
+}}
+
+# --- 2. Re-sourcing resilience while managed environment is active ---
+. '{hook_file}'
+if ($global:ENVY_MANAGED_VENV -ne '{proj_a / ".venv"}') {{
+    throw "Managed venv was discarded on re-source! Got: $global:ENVY_MANAGED_VENV"
+}}
+# Re-sourcing 5 times in a row -> no duplicate wrappers or duplicate notifications
+for ($i = 0; $i -lt 5; $i++) {{
+    . '{hook_file}'
+}}
+$pOutRepeat = (prompt)
+if ($pOutRepeat -like "*envy: venv loaded*") {{
+    throw "Spurious notification on repeat prompt after re-sourcing: $pOutRepeat"
+}}
+if ($pOutRepeat -ne "PROMPT_LINE1`nPROMPT_LINE2`nPS> ") {{
+    throw "Duplicate prompt output detected after re-sourcing! Got: '$pOutRepeat'"
+}}
+
+# --- 3. Manual activation protection across re-sourcing ---
+Set-Location '{no_venv}'
+$null = prompt
+if ($global:ENVY_MANAGED_VENV) {{ throw "Managed venv not cleared in no_venv" }}
+
+$env:VIRTUAL_ENV = "C:\\MockManualVenv"
+. '{hook_file}'
+if ($global:ENVY_MANAGED_VENV) {{
+    throw "Claimed ownership of manual venv! $global:ENVY_MANAGED_VENV"
+}}
+Remove-Item env:VIRTUAL_ENV
+
+# --- 4. Push-Location and Pop-Location ---
+Push-Location '{proj_b}'
+$pOut2 = (prompt)
+if ($env:VIRTUAL_ENV -ne '{proj_b / ".venv"}') {{
+    throw "Push-Location to projB failed: $env:VIRTUAL_ENV"
+}}
+if ($pOut2 -notlike "*envy: venv loaded*") {{
+    throw "Expected loaded notif on Push-Location, got: $pOut2"
+}}
+
+Pop-Location
+$pOut3 = (prompt)
+if ($env:VIRTUAL_ENV) {{
+    throw "Expected VIRTUAL_ENV to be empty after popping to no_venv: $env:VIRTUAL_ENV"
+}}
+
+# Push-Location from projA to projB and Pop back to projA
+Set-Location '{proj_a}'
+$null = prompt
+Push-Location '{proj_b}'
+$null = prompt
+if ($env:VIRTUAL_ENV -ne '{proj_b / ".venv"}') {{
+    throw "Push-Location to projB failed"
+}}
+Pop-Location
+$pPopA = (prompt)
+if ($env:VIRTUAL_ENV -ne '{proj_a / ".venv"}') {{
+    throw "Pop-Location to projA failed: $env:VIRTUAL_ENV"
+}}
+
+# --- 5. Unicode directory navigation ---
+Set-Location -LiteralPath '{unicode_proj}'
+$pOutUni = (prompt)
+if ($env:VIRTUAL_ENV -ne '{unicode_proj / ".venv"}') {{
+    throw "Navigation to Unicode project failed: $env:VIRTUAL_ENV"
+}}
+if ($pOutUni -notlike "*envy: venv loaded*") {{
+    throw "Expected loaded notif in Unicode project, got: $pOutUni"
+}}
+
+Set-Location '{no_venv}'
+$pOutLeaveUni = (prompt)
+if ($env:VIRTUAL_ENV) {{
+    throw "Failed to deactivate leaving Unicode project: $env:VIRTUAL_ENV"
+}}
+if ($pOutLeaveUni -notlike "*envy: venv unloaded*") {{
+    throw "Expected unloaded notif leaving Unicode project, got: $pOutLeaveUni"
+}}
+
+Write-Output "ALL_POWERSHELL_STAGE_C_TESTS_PASSED"
+"""
+            test_file = base / "run_stage_c_test.ps1"
+            test_file.write_text(test_script, encoding="utf-8-sig")
+
+            res = subprocess.run(
+                [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(test_file)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(res.returncode, 0, f"Stage C test failed with stderr: {res.stderr}\nstdout: {res.stdout}")
+            self.assertIn("ALL_POWERSHELL_STAGE_C_TESTS_PASSED", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

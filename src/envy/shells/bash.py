@@ -8,12 +8,22 @@ BASH_HOOK_TEMPLATE = r"""# Envy Bash Integration
 # Automatically switches Python virtual environments on directory changes.
 
 if [[ -z "${__ENVY_HOOKED:-}" ]]; then
-    export __ENVY_HOOKED=1
-    export ENVY_MANAGED_VENV=""
-    export ENVY_DEACTIVATED_DIR=""
-    export ENVY_FAILED_DIR=""
-    export __ENVY_PREV_PATH=""
-    export __ENVY_SAVED_DEACTIVATE_DEF=""
+    __ENVY_HOOKED=1
+    export -n __ENVY_HOOKED ENVY_MANAGED_VENV ENVY_DEACTIVATED_DIR ENVY_FAILED_DIR __ENVY_PREV_PATH __ENVY_SAVED_DEACTIVATE_DEF 2>/dev/null || true
+
+    # Preserve valid existing Envy ownership state if active and matching
+    if [[ -z "${ENVY_MANAGED_VENV:-}" || \
+          "${ENVY_MANAGED_VENV%/}" != "${VIRTUAL_ENV%/}" || \
+          ! -d "${ENVY_MANAGED_VENV}" || \
+          ! -e "${ENVY_MANAGED_VENV}/bin/python" || \
+          ! -f "${ENVY_MANAGED_VENV}/bin/activate" ]]; then
+        ENVY_MANAGED_VENV=""
+        __ENVY_PREV_PATH=""
+        __ENVY_SAVED_DEACTIVATE_DEF=""
+    fi
+
+    ENVY_DEACTIVATED_DIR=""
+    ENVY_FAILED_DIR=""
     __envy_oldpwd=""
 
     __envy_bin() {
@@ -57,13 +67,13 @@ if [[ -z "${__ENVY_HOOKED:-}" ]]; then
             # Restore pre-existing deactivate function if there was one; otherwise ensure cleanup
             if [[ -n "${__ENVY_SAVED_DEACTIVATE_DEF:-}" ]]; then
                 \builtin eval "${__ENVY_SAVED_DEACTIVATE_DEF}" 2>/dev/null || true
-                export __ENVY_SAVED_DEACTIVATE_DEF=""
+                __ENVY_SAVED_DEACTIVATE_DEF=""
             else
                 \builtin unset -f deactivate 2>/dev/null || true
             fi
             \builtin hash -r 2>/dev/null || true
 
-            export ENVY_MANAGED_VENV=""
+            ENVY_MANAGED_VENV=""
             \builtin echo "envy: venv unloaded"
         fi
     }
@@ -75,18 +85,18 @@ if [[ -z "${__ENVY_HOOKED:-}" ]]; then
 
         # If a virtual environment is active but not managed by Envy, respect manual user control
         if [[ -n "${VIRTUAL_ENV:-}" && "${VIRTUAL_ENV%/}" != "${ENVY_MANAGED_VENV%/}" ]]; then
-            export ENVY_MANAGED_VENV=""
+            ENVY_MANAGED_VENV=""
             return "${retval}"
         fi
 
         # If user explicitly called 'deactivate' inside a managed venv directory,
         # respect manual deactivation and do not reactivate until leaving this directory
         if [[ -n "${ENVY_MANAGED_VENV:-}" && -z "${VIRTUAL_ENV:-}" ]]; then
-            export ENVY_DEACTIVATED_DIR="${dir}"
-            export ENVY_MANAGED_VENV=""
+            ENVY_DEACTIVATED_DIR="${dir}"
+            ENVY_MANAGED_VENV=""
             if [[ -n "${__ENVY_SAVED_DEACTIVATE_DEF:-}" ]]; then
                 \builtin eval "${__ENVY_SAVED_DEACTIVATE_DEF}" 2>/dev/null || true
-                export __ENVY_SAVED_DEACTIVATE_DEF=""
+                __ENVY_SAVED_DEACTIVATE_DEF=""
             fi
         fi
 
@@ -107,12 +117,12 @@ if [[ -z "${__ENVY_HOOKED:-}" ]]; then
 
         # Reset manual deactivation memory when moving to a different directory
         if [[ -n "${ENVY_DEACTIVATED_DIR:-}" && "${dir}" != "${ENVY_DEACTIVATED_DIR}" ]]; then
-            export ENVY_DEACTIVATED_DIR=""
+            ENVY_DEACTIVATED_DIR=""
         fi
 
         # Reset failed directory memory when moving to a different directory
         if [[ -n "${ENVY_FAILED_DIR:-}" && "${dir}" != "${ENVY_FAILED_DIR}" ]]; then
-            export ENVY_FAILED_DIR=""
+            ENVY_FAILED_DIR=""
         fi
 
         __envy_oldpwd="${dir}"
@@ -166,10 +176,10 @@ if [[ -z "${__ENVY_HOOKED:-}" ]]; then
                     fi
 
                     if [[ ${act_ok} -eq 1 ]]; then
-                        export ENVY_MANAGED_VENV="${VIRTUAL_ENV:-${resolved}}"
-                        export __ENVY_PREV_PATH="${_pre_path}"
-                        export __ENVY_SAVED_DEACTIVATE_DEF="${_pre_deactivate_def}"
-                        export ENVY_FAILED_DIR=""
+                        ENVY_MANAGED_VENV="${VIRTUAL_ENV:-${resolved}}"
+                        __ENVY_PREV_PATH="${_pre_path}"
+                        __ENVY_SAVED_DEACTIVATE_DEF="${_pre_deactivate_def}"
+                        ENVY_FAILED_DIR=""
                         \builtin echo "envy: venv loaded"
                     else
                         # Rollback on activation failure
@@ -203,11 +213,11 @@ if [[ -z "${__ENVY_HOOKED:-}" ]]; then
                         else
                             \builtin unset -f deactivate 2>/dev/null || true
                         fi
-                        export __ENVY_SAVED_DEACTIVATE_DEF=""
+                        __ENVY_SAVED_DEACTIVATE_DEF=""
                         \builtin hash -r 2>/dev/null || true
 
-                        export ENVY_FAILED_DIR="${dir}"
-                        export ENVY_MANAGED_VENV=""
+                        ENVY_FAILED_DIR="${dir}"
+                        ENVY_MANAGED_VENV=""
                         \builtin echo "envy: failed to activate environment at '${resolved}'" >&2
                     fi
                 fi
